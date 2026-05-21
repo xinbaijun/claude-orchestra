@@ -1,0 +1,70 @@
+#!/bin/bash
+# work_log — 从 git log 整理工作日志原料（笨脚本，仅 dump，不加工）
+#
+# 用法：
+#   work_log                    今天
+#   work_log today              今天（显式）
+#   work_log yesterday          昨天
+#   work_log week               最近 7 天
+#   work_log 2026-05-14         指定单日
+#   work_log 2026-05-10 2026-05-14   日期范围
+#
+# 输出格式（按时间正序，最早在上）：
+#   ## 标签（如 2026-05-14）
+#
+#   - MM-DD HH:MM [shorthash] <commit subject>
+#     <commit body 第一段...>
+#
+#   ---
+#   共 N 个 commit
+#
+# 设计哲学：脚本越笨越好。加工（同主题合并 / 翻译 / 分时段 / 列阻塞）交给管家或 /daily SOP 做。
+
+set -e
+
+case "${1:-today}" in
+  today|"")
+    SINCE_DATE=$(date +%Y-%m-%d)
+    UNTIL_DATE="$SINCE_DATE"
+    LABEL="今天 ($SINCE_DATE)"
+    ;;
+  yesterday)
+    SINCE_DATE=$(date -d "yesterday" +%Y-%m-%d)
+    UNTIL_DATE="$SINCE_DATE"
+    LABEL="昨天 ($SINCE_DATE)"
+    ;;
+  week)
+    SINCE_DATE=$(date -d "7 days ago" +%Y-%m-%d)
+    UNTIL_DATE=$(date +%Y-%m-%d)
+    LABEL="最近 7 天 ($SINCE_DATE ~ $UNTIL_DATE)"
+    ;;
+  *)
+    # 单日或日期范围
+    SINCE_DATE="$1"
+    UNTIL_DATE="${2:-$1}"
+    if [ "$SINCE_DATE" = "$UNTIL_DATE" ]; then
+      LABEL="$SINCE_DATE"
+    else
+      LABEL="$SINCE_DATE ~ $UNTIL_DATE"
+    fi
+    ;;
+esac
+
+echo "## $LABEL"
+echo ""
+
+${GIT_WRAPPER} log \
+  --since "$SINCE_DATE 00:00:00" \
+  --until "$UNTIL_DATE 23:59:59" \
+  --reverse \
+  --pretty=format:"- %ad [%h] %s%n  %b" \
+  --date=format:"%m-%d %H:%M" \
+  2>/dev/null
+
+echo ""
+echo "---"
+COUNT=$(${GIT_WRAPPER} log \
+  --since "$SINCE_DATE 00:00:00" \
+  --until "$UNTIL_DATE 23:59:59" \
+  --oneline 2>/dev/null | wc -l)
+echo "共 $COUNT 个 commit"

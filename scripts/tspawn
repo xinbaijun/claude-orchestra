@@ -1,0 +1,65 @@
+#!/bin/bash
+# tspawn — 管家一键 spawn cc worker（new-session + cc + 等就绪 + rename + 注入 prompt + Enter）
+#
+# 替代 /dispatch SOP 里 8 行 raw tmux + sleep 5 写死的脆弱序列。智能等待 cc
+# 就绪（poll capture-pane 看到 ❯ prompt 出现），不死等。
+#
+# 用法：
+#   tspawn <session-name> <prompt-file>
+#
+# Exit codes:
+#   0  成功
+#   1  prompt 文件不存在
+#   2  session 重名
+#   3  cc 启动超时（15s 内没看到 ❯ prompt）
+
+set -euo pipefail
+
+SESSION="${1:?用法: tspawn <session-name> <prompt-file>}"
+PROMPT="${2:?用法: tspawn <session-name> <prompt-file>}"
+
+# 校验 prompt 文件
+if [[ ! -f "$PROMPT" ]]; then
+  echo "❌ prompt 文件不存在: $PROMPT" >&2
+  exit 1
+fi
+
+# 校验 session 不重名
+if tmux has-session -t "$SESSION" 2>/dev/null; then
+  echo "❌ session 已存在: $SESSION（先 tmux kill-session -t $SESSION 或换个名）" >&2
+  exit 2
+fi
+
+# 1. 起 detached session（cwd = ${PROJECT_ROOT} 让 cc 启动在 repo 根）+ 启 cc
+tmux new-session -d -s "$SESSION" -c ${PROJECT_ROOT}
+tmux send-keys -t "$SESSION" "${CLI_CMD}" Enter
+
+# 2. poll cc 就绪（最多 15s，每 0.5s 查一次 capture-pane 看 ❯ prompt）
+ready=0
+for _ in $(seq 1 30); do
+  sleep 0.5
+  if tmux capture-pane -t "$SESSION" -p | grep -qF "❯"; then
+    ready=1
+    break
+  fi
+done
+
+if [[ $ready -eq 0 ]]; then
+  echo "❌ cc 启动超时（15s 未见 ❯ prompt），session 留着方便手动救场: tmux attach -t $SESSION" >&2
+  exit 3
+fi
+
+# 3. /rename 对齐 CC 会话名
+tmux send-keys -t "$SESSION" "/rename $SESSION" Enter
+sleep 1
+
+# 4. load-buffer + paste-buffer + Enter 注入 prompt
+tmux load-buffer "$PROMPT"
+tmux paste-buffer -t "$SESSION"
+tmux send-keys -t "$SESSION" Enter
+sleep 1
+# 兜底 double Enter（paste 大文件偶尔 Enter 漏；cc 对重复 Enter 幂等）
+tmux send-keys -t "$SESSION" Enter
+
+echo "✅ spawned $SESSION + 注入 $(wc -l < "$PROMPT") 行 prompt"
+echo "   attach: tmux attach -t $SESSION  (或新终端窗口跑这条)"

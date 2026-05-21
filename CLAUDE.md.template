@@ -1,0 +1,209 @@
+# ${PROJECT_NAME} — Claude Code 项目指令
+
+> 这是 `CLAUDE.md` 模板。两段结构：**[业务段]** 用户填写 / **[工作流通用段]** 模板自带不改。
+>
+> 业务段写完后，把整个文件移到项目根 `${PROJECT_ROOT}/CLAUDE.md`（去掉 `.template` 后缀）。
+
+---
+
+## ⚠️ 最高优先级：结束信号必触发收尾流程（长对话也不能跳过）
+
+**这条规则的优先级高于本文件任何其他规则。** 即使对话已经很长、上下文已经压缩、Claude 注意力可能漂移 —— 看到下列**结束信号**之一，必须**立即停下手头讨论**，强制按 `.claude/commands/done.md` 里的 10 步流程走完整收尾：
+
+- 「收工」「下班」「完工」「这里告一段落」
+- 「先到这」「先这样」「停一下」
+- 「明天继续」「等会再说」「后面再说」「过会儿弄」
+- 「我去测试一下」「我去试试」「我去吃饭 / 睡觉 / 开会」「我先忙别的」
+- 用户主动打 `/done` / `/收工`
+
+**不能因为"这次没改多少代码"就跳过**。即使全程只是讨论，也至少要走 Step 4（检查 resume_here）+ Step 5（检查 pending_questions）+ Step 8（主动问"还有没忘的吗"）。
+
+**长对话的自检触发：** 如果你发现自己快忘了这条规则（例如已经聊了几十轮、好几次工具调用），主动停一下回顾 CLAUDE.md 顶部这条。这是防漂移的护栏。
+
+---
+
+## 【业务段 — 用户填写】
+
+> 下面 6 段是项目特定信息，填完前模板"通用段"不会知道你这是啥项目。
+> 标 `<...>` 的地方按提示填，不需要的段删掉。
+
+### 项目概述
+
+| 项目 | 说明 |
+|------|------|
+| 项目名 | ${PROJECT_NAME} |
+| 类型 | <Flutter App / Web 前端 / Python 服务 / etc.> |
+| 业务 | <一句话描述> |
+| 后端 | <API base URL，如有> |
+| 设计稿 | <Figma file key / 链接，如有> |
+
+### 用户信息
+
+- **<用户名>**：<角色 + 技能>
+- 用 <中文/英文> 回复
+- 开发环境：<Mac / Linux / Windows + WSL / etc.>
+- <其它偏好：不要时间估算 / 喜欢看 diff / 等>
+
+### 技术栈
+
+| 技术 | 说明 |
+|------|------|
+| 框架 | <eg. Flutter / Next.js / Django> |
+| 状态管理 | <如适用> |
+| 网络层 | <如适用> |
+| ... | ... |
+
+### 项目结构
+
+```
+${PROJECT_ROOT}/
+├── ...
+```
+
+### 关键文件索引（业务侧）
+
+| 文件 | 用途 |
+|---|---|
+| <path> | <说明> |
+| ... | ... |
+
+### 常见坑（业务特定）
+
+- <项目踩过的特定技术坑，比如 GetX `.obs` 语法 / React useEffect 等>
+
+---
+
+## 【工作流通用段 — 模板自带，不要改】
+
+### 每次会话开头（按顺序读这 4 个地方）
+
+1. `CLAUDE.md`（本文件，规则）
+2. `docs/ai-workflow/pending_tests.md` 待测队列
+3. `docs/ai-workflow/resume_here.md` 最上方那条未完成任务（如果没有就跳过）
+4. `docs/ai-workflow/pending_questions.md` 待解决问题
+
+读完简短告诉用户：上次做到哪、有没有待确认的问题、有没有该测但还没测的。**不要依赖**历史对话标题或上一次 Claude 会话上下文 —— 真相只在文档里。
+
+**开新任务时强制 /rename（不是建议，是必须）**：如果用户说要做的是一个新任务（不是接 resume_here 里某条），生成交接 prompt 时**必须**把 `/rename <任务简称>` 作为独立 **Step 0** 拎出来单独列出。
+
+### 多对话/任务状态管理
+
+完整 SOP 在 `docs/ai-workflow/workflow.md` 和 `.claude/commands/done.md` / `.claude/commands/butler.md`。
+本节只列**必须立刻知道**的规则：
+
+| 情境 | 必须做 | 写到哪 |
+|---|---|---|
+| 用户说结束信号（见上方 ⚠️ 段） | **主动**触发 `/done` 10 步流程 | `.claude/commands/done.md` |
+| 任务没干完中止 | 在 resume_here.md 最上面追加一条 | `docs/ai-workflow/resume_here.md` |
+| 需要用户拍板的问题 | 对话里问 **同时** append 到文件 | `docs/ai-workflow/pending_questions.md` |
+| 改了代码当场没法测 | 登记到待测队列 | `docs/ai-workflow/pending_tests.md` |
+| 任务完成 | 清 resume / 勾 pending / 移待测 + commit | 走 `/done` 流程 |
+
+**两种对话模式：** 默认工作 Claude（写代码）；`/butler` 进管家 Claude（只读总结、禁止改业务代码）。**不可就地切换**。
+
+### 每完成一个功能后（最低限度）
+
+完整 10 步流程打 `/done` 触发（详见 `.claude/commands/done.md`）。
+
+**⚠️ 强制规则：只要本轮回复里有任何代码改动（Edit / Write / NotebookEdit 至少触发一次），回复结尾**必须**执行 commit**。判断条件**不是**"功能完成了没"，**是**"这一轮有没有动代码"。
+
+**执行细节**：
+
+- stage 文件用**白名单 explicit 路径**，**永远不要** `${GIT_WRAPPER} add -A` / `${GIT_WRAPPER} add .`（会污染其它 worker / 调试脚本的产物）
+- commit message 走 stdin：`cat <<'EOF' | ${GIT_WRAPPER} commit -F - ... EOF`，避免引号/换行被 shell 二次解析
+- commit 报错 → 停下来把错误给用户，**不要自动 amend / 不要绕过 / 不要换姿势重试**
+- 一轮多文件改动同主题 → 一条合并 commit；几个完全无关的改动 → 分次执行
+
+**opt-out**：用户说"先别 commit / 我一会儿统一 commit / 我自己 commit"任一种 → 本会话剩余轮次退回只给"💾 建议 commit message"不执行。
+
+**⏰ 时间戳必须 `date` 取，禁止脑补**：upsert `session_board.md` / append `notifications.md` / 写 `resume_here.md` / 任何带时间字段的写入前**必须**跑 `date '+%Y-%m-%d %H:%M'` 拿真时间，不要按"上次活跃"+"我感觉过了多久"心算（实测会一路漂到几小时未来）。
+
+### 会话开头主动注册 session_board
+
+工作对话读完启动文件后，如果 prompt 历史里能看到 `Session renamed to: xxx`，**立刻 upsert 自己那行**到 `docs/ai-workflow/session_board.md`（状态 🟢 active，当前任务 = 用户首句话或接的 resume 标题，最后活跃 = 当前时间）。
+
+**Step 0.5 模式**：派单生成的 prompt 文件**第一段 Step 0.5** 强制 worker `/rename` 完立即 upsert board（不等 Phase 1 摸排）。
+
+之后每次执行 commit / 走 `/catchup` / 走 `/done` 时，都要 upsert 本会话那一行。
+
+格式：
+
+| Session 名 | 当前任务 | 最后活跃 | 状态 | 备注 |
+
+字段：
+
+- **Session 名**：从 `Session renamed to:` 取
+- **当前任务**：本会话目前在干啥，一句话
+- **最后活跃**：当前对话时间戳，格式 `YYYY-MM-DD HH:MM`
+- **状态**：🟢 active / 🟡 等用户 / 🔴 待收工 / ⚫ blocked / ⚪ 已完工 / ⚪ 已挂起
+- **备注**：极简，可空。末尾追加 `; jsonl=<UUID 前 8 位>` 方便 tmux 崩后 `revive <session>` 救活（注册时跑 `myjsonl | cut -c1-8` 拿）
+
+### 管家决策 audit trail（butler_decisions.md）
+
+`/butler` 对话**不**写代码不动业务文件（硬约束），但**自己做的决策**（派单 / kill / 拍板方案 / 改 SOP / 事故处理 / 救活 worker / 教学等）需要留痕到 `docs/ai-workflow/butler_decisions.md`，跨天回顾 + `/daily` + 老板对账用。
+
+**架构**：butler_decisions.md 跟 notifications.md 是**同 pattern** —— append-only 单文件事件流，worker 写自己的事件 / 管家写自己的事件。`/butler` 顶部硬约束已加白名单例外。
+
+**操作姿势**（管家做决策当下立即做）：
+
+1. `Read` `docs/ai-workflow/butler_decisions.md` 拿「通知流」段顶部上下文（head 50 行够）
+2. `Edit` append 一行到「通知流」段顶部（紧贴 section header 下方，最新在上）
+3. 单条格式：`- YYYY-MM-DD HH:MM | <status> | <emoji 类型> | <一句话决策>`（status 默认 ⏳ 待验收）
+
+格式 / emoji 类型表见 `butler_decisions.md` 顶部。
+
+**关于 commit**：
+
+- 管家 Edit **默认不 commit**（butler_decisions.md 已加进 race trailer 排除清单）
+- batch commit 由 chore-runner 触发：管家跑 `/peek` Step 6 检测 dirty + 累积 ≥ 3 条新决策（或距上次 commit > 2h）→ 派 chore-runner 顺手 `${GIT_WRAPPER} add` + commit；或用户口语"小弟 commit 一下管家决策"显式触发
+
+**status 默认 ⏳ 待验收**：管家 append 时**每条新决策默认状态 `⏳`**，不自动转 ✅。用户后续显式 conversational 触发改 ✅ / ❌。
+
+### 长 idle worker 处理（两步法）
+
+worker 长时间不动（**jsonl > 72 小时** + capture-pane 无 thinking spinner + 用户主动判断"等触发条件 / 想做但没动力"）→ 走两步法：
+
+**Step 1 — Kill worker**：`tmux kill-session -t <worker>` 释放 tmux session；jsonl 留着，未来 `revive <worker>` 一行救活 hot context。
+
+**Step 2 — resume_here.md 记触发条件**：管家硬约束不能直接 Edit → 派 chore-runner append 一条到 `docs/ai-workflow/resume_here.md`，**必填「触发条件」段**（满足任一即可续）。
+
+### Git 操作约定
+
+- 走 `${GIT_WRAPPER}`（默认 `git`；如有 wrapper 替换）
+- commit author 由用户的 git config 决定，**不要在 commit 时改 author**
+- commit message 永远走 `type: 描述` 模板（type: feat / fix / refactor / docs / chore / style / test）
+- **Claude 永远不要主动 push** —— push 由用户在合适的时机自己跑
+
+### 开发顺序
+
+布局 → 交互 → 动效 → 接 API
+
+UI 修改优先于接 API（避免接完又白做）。
+
+### 写代码前
+
+- 先看项目通用组件目录，优先复用已有组件
+- 先列改动计划给用户确认，确认后再写代码
+
+### 按钮连点防御（如适用）
+
+UI 框架有"按钮连点"问题的项目（Flutter / React Native 等），所有 async 接口按钮 / 路由按钮 / 弹窗 picker **统一包防抖组件**（项目自己定义；模板不提供具体实现）。关键 POST/写操作 UI 包防抖**同时** logic 层加 `bool _inFlight` latch + try/finally（双层防御）。
+
+### 关键文件索引（工作流通用）
+
+| 文件 | 用途 |
+|------|------|
+| `docs/ai-workflow/workflow.md` | 工作流总览地图（管家对话必读；用户随时翻阅） |
+| `docs/ai-workflow/resume_here.md` | 未完成任务索引（中止信号必更新，下次会话开头第一个读） |
+| `docs/ai-workflow/pending_questions.md` | 待用户确认问题集中区（不要只在对话里问） |
+| `docs/ai-workflow/pending_tests.md` | 待测试队列（代码改了但当场没法测的真机/iOS/Android/长跑项） |
+| `docs/ai-workflow/session_board.md` | 当前活跃对话面板（一张表看清谁在干啥/卡哪/最后什么时候动） |
+| `docs/ai-workflow/notifications.md` | worker 完工 push 给管家的事件流（append-only） |
+| `docs/ai-workflow/butler_decisions.md` | 管家决策 audit trail（append-only） |
+| `docs/ai-workflow/known_pitfalls.md` | 域特定坑点库（遇到诡异问题 grep 一下） |
+| `.claude/commands/done.md` | `/done` 命令的 10 步收尾 SOP |
+| `.claude/commands/butler.md` | `/butler` 命令的 5 段只读总结 SOP |
+| `.claude/commands/dispatch.md` | `/dispatch <task>` 派单 SOP（仅管家可用） |
+| `.claude/commands/peek.md` | `/peek` 巡视 SOP（仅管家可用） |
+| `.claude/commands/catchup.md` | `/catchup` 中场补漏 SOP |
+| `.claude/commands/daily.md` | `/daily` 工作日报 SOP |

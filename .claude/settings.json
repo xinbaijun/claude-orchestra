@@ -1,0 +1,21 @@
+{
+  "hooks": {
+    "Notification": [
+      {
+        "matcher": "permission_prompt|idle_prompt",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "printf '\\a' > /dev/tty 2>/dev/null || printf '\\a' >&2 2>/dev/null || true"
+          }
+        ]
+      }
+    ]
+  },
+  "permissions": {
+    "allow": [
+      "Bash(tmux ls)",
+      "Bash(tmux list-panes:*)"
+    ]
+  }
+}

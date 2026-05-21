@@ -1,0 +1,67 @@
+#!/bin/bash
+# myjsonl — 当前 cc 进程的 jsonl UUID（用于 tmux 崩后 cc --resume 救活）
+#
+# 用法：
+#   myjsonl              # 输出完整 UUID（如 f3077403-2880-4ff4-8a36-0196e4e0b17c）
+#   UUID=$(myjsonl)      # 拿到变量
+#   myjsonl | cut -c1-8  # 拿前 8 位（注册到 session_board.md 备注用）
+#
+# 原理：cc 启动时把自己的 (pid, sessionId, cwd, name) 写到
+#   ~/.claude/sessions/<pid>.json。worker 跑 Bash 工具时进程树形如
+#   cc → bash -c → 本脚本，从 $PPID 往上回溯到 cmdline 含 claude 的进程
+#   即 cc pid，读 sessions/<cc-pid>.json 拿 sessionId（jsonl 文件位置：
+#   ${JSONL_DIR}/<sessionId>.jsonl）。
+#
+# Exit codes:
+#   0  成功
+#   1  进程树里没找到 cc claude 进程（不在 cc 环境）
+#   2  sessions/<cc-pid>.json 不存在（cc 版本太旧不写本文件）
+#   3  JSON 里 sessionId 字段为空 / 解析失败
+
+set -euo pipefail
+
+# 从 $PPID 往上回溯找 cmdline 含 claude 的进程（最多爬 8 层防死循环）
+pid="$PPID"
+cc_pid=""
+for _ in $(seq 1 8); do
+  [[ -z "$pid" || "$pid" = "0" || "$pid" = "1" ]] && break
+  cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)
+  # 匹配 "claude"（行首 / 路径分隔 / 前后空格）但跳过 bash 等 shell
+  if [[ "$cmd" =~ (^|/)claude($| ) ]]; then
+    cc_pid="$pid"
+    break
+  fi
+  pid=$(awk '/^PPid:/ {print $2}' "/proc/$pid/status" 2>/dev/null || true)
+done
+
+if [[ -z "$cc_pid" ]]; then
+  cat >&2 <<EOF
+❌ 进程树里没找到 cc claude 进程（爬到 PID=$pid 仍未命中）
+   排查：
+   1. cat /proc/\$PPID/cmdline | tr '\0' ' '   看起点是什么进程
+   2. ps -o pid,ppid,cmd $PPID                看父进程链
+   不在 cc 环境（裸 shell / cron / systemd）时本工具无意义。
+EOF
+  exit 1
+fi
+
+state_file="$HOME/.claude/sessions/${cc_pid}.json"
+
+if [[ ! -f "$state_file" ]]; then
+  cat >&2 <<EOF
+❌ $state_file 不存在
+   cc 版本太旧不写本文件，或 sessions 目录被清理。
+   手动找：grep -l '"pid":${cc_pid}' $HOME/.claude/sessions/*.json
+EOF
+  exit 2
+fi
+
+# 提取 "sessionId":"xxx" 字段，无 jq 依赖
+uuid=$(grep -oE '"sessionId":"[0-9a-f-]+"' "$state_file" | head -1 | cut -d'"' -f4)
+
+if [[ -z "$uuid" ]]; then
+  echo "❌ $state_file 里没找到 sessionId 字段（cc 状态文件格式异常）" >&2
+  exit 3
+fi
+
+echo "$uuid"

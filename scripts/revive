@@ -1,0 +1,151 @@
+#!/bin/bash
+# revive — 一键救活 cc worker（cc --resume 流程封装）
+#
+# 用法：
+#   revive <session-name>
+# 例：
+#   revive damodel-recon
+#
+# 内部步骤：
+#   1. session 已存在防呆（让用户先 attach 看活着不）
+#   2. 找 jsonl UUID（两条路线）：
+#      A. grep session_board.md 找该 row 的 jsonl=<前 8 位>，ls 完整 UUID
+#      B. A 失败兜底：grep 所有 jsonl 内容找 "Session renamed to: <name>"
+#   3. tmux new-session -d -s <name> -c ${PROJECT_ROOT}
+#   4. send-keys "${CLI_CMD} --resume <uuid>" Enter
+#   5. sleep 8 + capture-pane 验证 cc 起来了
+#   6. 检测 board 历史活跃段有该 session → 自动搬回活跃段（治板漂延迟）
+#
+# Exit codes:
+#   0  成功
+#   1  缺参数
+#   2  session 已存在
+#   3  找不到 jsonl UUID
+
+set -euo pipefail
+
+SESSION="${1:?用法: revive <session-name>}"
+BOARD="${PROJECT_ROOT}/docs/ai-workflow/session_board.md"
+JSONL_DIR="${JSONL_DIR}"
+
+# Step 1: session 已存在防呆
+if tmux has-session -t "$SESSION" 2>/dev/null; then
+  cat >&2 <<EOF
+❌ session 已存在: $SESSION
+   先 tmux attach -t $SESSION 看是不是还活着
+   真死了主动 tmux kill-session -t $SESSION 再 revive
+EOF
+  exit 2
+fi
+
+# Step 2 路线 A: session_board.md 找 jsonl=<前 8 位>
+prefix=$(grep -F "\`$SESSION\`" "$BOARD" 2>/dev/null | grep -oE 'jsonl=[0-9a-f]{8}' | head -1 | cut -d= -f2 || true)
+
+uuid=""
+if [[ -n "$prefix" ]]; then
+  matches=$(ls -t "$JSONL_DIR"/"$prefix"*.jsonl 2>/dev/null)
+  match_count=$(echo "$matches" | grep -c . || true)
+  if [[ "$match_count" -gt 1 ]]; then
+    echo "⚠️  jsonl 前 8 位 $prefix 多个匹配 ($match_count 个)，选 mtime 最新" >&2
+  fi
+  first=$(echo "$matches" | head -1)
+  if [[ -n "$first" ]]; then
+    name=${first##*/}
+    uuid=${name%.jsonl}
+  fi
+fi
+
+# Step 2 路线 B 兜底: grep jsonl 内容找真 rename 事件
+if [[ -z "$uuid" ]]; then
+  echo "ℹ️  session_board 没找到 $SESSION 的 jsonl 前 8 位，路线 B grep jsonl 真 rename 事件..." >&2
+  matches=$(grep -lF "<local-command-stdout>Session renamed to: $SESSION</local-command-stdout>" "$JSONL_DIR"/*.jsonl 2>/dev/null || true)
+  if [[ -n "$matches" ]]; then
+    sorted=$(echo "$matches" | xargs ls -t 2>/dev/null)
+    match_count=$(echo "$sorted" | grep -c . || true)
+    if [[ "$match_count" -gt 1 ]]; then
+      echo "⚠️  jsonl 内容多个匹配 ($match_count 个)，选 mtime 最新" >&2
+    fi
+    first=$(echo "$sorted" | head -1)
+    name=${first##*/}
+    uuid=${name%.jsonl}
+  fi
+fi
+
+if [[ -z "$uuid" ]]; then
+  cat >&2 <<EOF
+❌ 找不到 $SESSION 的 jsonl UUID
+   session_board.md 也没该 row 的 jsonl=<前 8 位>；jsonl 文件内容也搜不到
+   手动找：grep -l 'Session renamed to: $SESSION' $JSONL_DIR/*.jsonl
+   或按 mtime 倒序看最近 jsonl：ls -lt $JSONL_DIR/*.jsonl | head -10
+EOF
+  exit 3
+fi
+
+echo "🔍 找到 UUID: $uuid"
+
+# Step 3-4: 起 tmux + cc --resume
+tmux new-session -d -s "$SESSION" -c ${PROJECT_ROOT}
+tmux send-keys -t "$SESSION" "${CLI_CMD} --resume $uuid" Enter
+
+# Step 5: 等 cc resume + 验证
+echo "⏳ 等 cc 起来（8s）..."
+sleep 8
+output=$(tmux capture-pane -t "$SESSION" -p 2>/dev/null | tail -10)
+
+if echo "$output" | grep -qF "❯"; then
+  cat <<EOF
+✅ revived $SESSION（cc 已起，hot context 应该接上了）
+   attach 验证：tmux attach -t $SESSION
+   看到老对话上下文 → 成功；看到 "Welcome to Claude Code" → resume 失败 fresh cc 起了
+EOF
+
+  # Step 6: 自动搬板（治板漂延迟）
+  echo ""
+  echo "🔄 检测 board 状态..."
+
+  if awk '/^## 历史活跃$/,/^---$/' "$BOARD" 2>/dev/null | grep -qE "^- 20[0-9]{2}-.*⚪ \`$SESSION\`"; then
+    echo "  历史活跃段找到 ⚪ $SESSION → 自动搬板"
+
+    NOW=$(date '+%Y-%m-%d %H:%M')
+    JSONL_SHORT="${uuid:0:8}"
+    NEW_ROW="| \`$SESSION\` | revive 救活继续（任务延续从历史段，详情见原 ⚪ 记录 git history） | $NOW | 🟢 active | revive $NOW 救活 hot context；jsonl=$JSONL_SHORT |"
+
+    # Pass 1: 删历史活跃段 ⚪ <session> 整段
+    awk -v sess="$SESSION" '
+      /^## 历史活跃$/                       { in_hist = 1; print; next }
+      /^## / && !/^## 历史活跃$/            { in_hist = 0; skipping = 0 }
+      in_hist && /^- 20[0-9]{2}-/ {
+        if (match($0, "⚪ `" sess "`")) { skipping = 1; next }
+        else                           { skipping = 0 }
+      }
+      skipping { next }
+      { print }
+    ' "$BOARD" > "$BOARD.tmp1"
+
+    # Pass 2: 表格 separator 后插新行
+    awk -v row="$NEW_ROW" '
+      /^\|---\|---\|---\|---\|---\|$/ { print; print row; next }
+      { print }
+    ' "$BOARD.tmp1" > "$BOARD.tmp2"
+
+    mv "$BOARD.tmp2" "$BOARD"
+    rm -f "$BOARD.tmp1"
+
+    # commit（cd ${PROJECT_ROOT} 保 git 跑在 repo 根目录）
+    (cd ${PROJECT_ROOT} && ${GIT_WRAPPER} add docs/ai-workflow/session_board.md && \
+       ${GIT_WRAPPER} commit -m "chore(board): $SESSION revive 后自动搬板（历史 → 活跃）")
+
+    echo "✅ board 自动搬板完成"
+  else
+    echo "  ⚠️  board 历史段没找到 $SESSION → skip 搬板（可能 board 全失踪 / 已在活跃段）"
+  fi
+else
+  cat <<EOF
+⚠️  cc 可能还在 load / 或 resume 失败，capture-pane 输出：
+---
+$output
+---
+   切过去手动看：tmux attach -t $SESSION
+   如果是 fresh cc UI（无 hot context）→ UUID 可能拼错 / jsonl 损坏，重选 UUID
+EOF
+fi

@@ -1,0 +1,104 @@
+#!/bin/bash
+# jsonl-status — 给定 tmux session（或默认全部非管家 session）反查 cc jsonl mtime（活跃度信号）
+#
+# 用法：
+#   jsonl-status                              # 默认：全部非管家 tmux session
+#   jsonl-status chore-runner                 # 单 session 查
+#   jsonl-status chore-runner button-debounce # 多 session 查
+#
+# 输出（紧凑表格 + 可 grep）：
+#   session                    jsonl mtime
+#   ─────────────────────────  ──────────
+#   chore-runner               2m
+#   wallpaper-photo-upload     9m
+#   damodel-recon              NOT FOUND
+#
+# 反查策略（封装 /peek SOP Step 2 信号 B）：
+#   Path A（主）：tmux list-panes pane_pid → pgrep -P claude 拿 cc_pid →
+#                jq 读 ~/.claude/sessions/<cc_pid>.json sessionId
+#                → stat jsonl mtime
+#   Path B（兜底）：A 拿不到 → grep "Session renamed to: <session>" 反查所有 jsonl
+#                  → xargs ls -t 取最新 mtime
+#   都不行 → 输出 NOT FOUND
+#
+# /clear 已知盲点：worker /clear 后 cc 起新 jsonl 但 sessions/<pid>.json sessionId
+#   字段冻结在 cc 启动时，Path A 拿到旧 jsonl mtime；Path B 同样找不到 post-/clear
+#   新 jsonl（无 rename event）。这种 case capture-pane 信号 A 优先于 jsonl mtime。
+#
+# Exit codes:
+#   0  全部 session 拿到 mtime（含 Path B 兜底）
+#   1  ≥ 1 session NOT FOUND
+#   2  tmux ls 失败 / 服务器异常
+
+set -uo pipefail
+# 注意：不 set -e，单 session 失败不停整批
+
+JSONL_DIR="${JSONL_DIR}"
+SESSIONS_DIR="$HOME/.claude/sessions"
+
+# Step 1: 收集 target session 列表
+if [[ $# -gt 0 ]]; then
+  sessions=("$@")
+else
+  # 默认拿全部非管家 session（排除 ${BUTLER_SESSION} 锚点）
+  if ! tmux ls 2>/dev/null > /tmp/jsonl-status-tmuxls.$$; then
+    echo "❌ tmux ls 失败 — 没在 tmux 环境 / tmux server 没起来" >&2
+    rm -f /tmp/jsonl-status-tmuxls.$$
+    exit 2
+  fi
+  mapfile -t sessions < <(grep -vE '^${BUTLER_SESSION}:' /tmp/jsonl-status-tmuxls.$$ | cut -d: -f1)
+  rm -f /tmp/jsonl-status-tmuxls.$$
+fi
+
+if [[ ${#sessions[@]} -eq 0 ]]; then
+  echo "⚠️  无非管家 session" >&2
+  exit 0
+fi
+
+# Step 2: 探测每个 session jsonl mtime
+NOW_EPOCH=$(date +%s)
+exit_code=0
+
+printf '%-26s %s\n' "session" "jsonl mtime"
+printf '%-26s %s\n' "─────────────────────────" "──────────"
+
+for sess in "${sessions[@]}"; do
+  jsonl=""
+
+  # Path A: tmux pane pid → cc pid → sessions/<pid>.json sessionId
+  pane_pid=$(tmux list-panes -t "$sess" -F '#{pane_pid}' 2>/dev/null | head -1)
+  if [[ -n "$pane_pid" ]]; then
+    cc_pid=$(pgrep -P "$pane_pid" claude 2>/dev/null | head -1)
+    if [[ -n "$cc_pid" && -f "$SESSIONS_DIR/${cc_pid}.json" ]]; then
+      sid=$(grep -oE '"sessionId":"[0-9a-f-]+"' "$SESSIONS_DIR/${cc_pid}.json" | head -1 | cut -d'"' -f4)
+      if [[ -n "$sid" && -f "$JSONL_DIR/${sid}.jsonl" ]]; then
+        jsonl="$JSONL_DIR/${sid}.jsonl"
+      fi
+    fi
+  fi
+
+  # Path B: grep "Session renamed to: <sess>" 反查最新 jsonl
+  if [[ -z "$jsonl" ]]; then
+    matches=$(grep -lF "<local-command-stdout>Session renamed to: $sess</local-command-stdout>" \
+              "$JSONL_DIR"/*.jsonl 2>/dev/null || true)
+    if [[ -n "$matches" ]]; then
+      jsonl=$(echo "$matches" | xargs ls -t 2>/dev/null | head -1)
+    fi
+  fi
+
+  # 输出 mtime 或 NOT FOUND
+  if [[ -n "$jsonl" && -f "$jsonl" ]]; then
+    mt=$(stat -c %Y "$jsonl" 2>/dev/null || echo "")
+    if [[ -n "$mt" ]]; then
+      printf '%-26s %dm\n' "$sess" $(( (NOW_EPOCH - mt) / 60 ))
+    else
+      printf '%-26s %s\n' "$sess" "NOT FOUND"
+      exit_code=1
+    fi
+  else
+    printf '%-26s %s\n' "$sess" "NOT FOUND"
+    exit_code=1
+  fi
+done
+
+exit "$exit_code"

@@ -1,0 +1,15 @@
+# 用户/项目个人配置（不入 repo）
+.claude/settings.local.json
+.claude/MEMORY.md
+
+# 派单 prompt 缓存（worker 用完即弃 / 个人调试产物）
+.prompts/
+
+# 历史归档目录（如启用，超 5000 行切片到这里）
+docs/_archive/
+
+# Editor / OS noise
+*.tmp
+*.swp
+.DS_Store
+Thumbs.db
