@@ -1,0 +1,249 @@
+#!/bin/bash
+# restart-chore — service worker (chore-runner / chore-monitor) in-place 重启
+#
+# 固化 service worker 重启流程（hot context 太大 / 卡 ${CLI_CMD} parser quirk /
+# prompt 模板改了想重 load 时一行命令搞定，替代手敲 11 步 tmux 序列）。
+#
+# 用法：
+#   restart-chore                         默认重启 chore-runner + chore-monitor 两个
+#   restart-chore chore-runner            单个重启
+#   restart-chore chore-monitor           单个重启
+#   restart-chore --reload                只 tpush reload prompt 不 kill ${CLI_CMD}（轻量更新规则）
+#   restart-chore --reload chore-monitor  单个 reload
+#   restart-chore -h | --help             usage
+#
+# ⚠️ chore-runner 不能自己跑 `restart-chore chore-runner` / `restart-chore`（无参数）
+#    脚本顶部安全检查：跑前 tmux display-message 看是不是在 chore-runner session，
+#    是 → exit 1 拒绝执行（自杀防御）。--reload 模式安全（不 kill ${CLI_CMD}）。
+#
+# 模型差异（vs xhm 老版）：
+#   - 模板默认「一任务一 session」 → chore-runner / chore-monitor 各占独立 tmux session
+#   - xhm 老版用 xhm:<window> 模型已废弃
+#
+# Exit codes:
+#   0  完成
+#   1  自杀防御 / sentinel daemon 不在 / 参数错误
+#   2  ${CLI_CMD} 启动超时（30s 未见 ❯）
+#   3  tpush reload 失败
+
+set -uo pipefail
+
+# ── prompt 模板路径（spawn / reload 共用）──
+declare -A PROMPT_PATH=(
+  [chore-runner]=${PROJECT_ROOT}/scripts/.prompts-templates/chore-runner.md
+  [chore-monitor]=${PROJECT_ROOT}/scripts/.prompts-templates/chore-monitor.md
+)
+
+usage() {
+  cat <<EOF
+用法：restart-chore [chore-runner|chore-monitor] [--reload]
+  restart-chore                         默认重启 chore-runner + chore-monitor 两个（完整 in-place 重启）
+  restart-chore chore-runner            单个完整重启
+  restart-chore chore-monitor           单个完整重启
+  restart-chore --reload                只 tpush reload prompt 不 kill ${CLI_CMD}（轻量更新规则）
+  restart-chore --reload chore-monitor  单个 reload
+  restart-chore -h | --help             本帮助
+
+完整重启流程 11 步：
+  1. sentinel unregister  防 race
+  2. tmux kill-session    杀老 ${CLI_CMD} + session
+  3. tmux new-session     起新 session（-c \${PROJECT_ROOT} -d）
+  4. send "${CLI_CMD}"    起 ${CLI_CMD}
+  5. poll ❯ prompt        最多 30s
+  6. send "/rename <n>"   命名
+  7. load-buffer prompt   读模板
+  8. paste-buffer         粘到 ${CLI_CMD}
+  9. send Enter           提交
+ 10. sentinel register    self-autobatch 5 30
+ 11. verify + RSS/etime 报告
+
+--reload 流程（不 kill ${CLI_CMD}）：
+  1. write /tmp/restart-chore-reload-<n>.md 一行内容
+  2. tpush <n> /tmp/restart-chore-reload-<n>.md --force
+  3. print 完工
+
+⚠️ 自杀防御：chore-runner 自己跑 spawn 模式会 exit 1（kill 自己）。
+   --reload 模式安全。
+EOF
+}
+
+# ── arg parse ──
+RELOAD=0
+TARGETS=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --reload)      RELOAD=1; shift ;;
+    -h|--help)     usage; exit 0 ;;
+    chore-runner|chore-monitor)
+                   TARGETS+=("$1"); shift ;;
+    *)             echo "❌ 未知参数: $1" >&2; usage >&2; exit 1 ;;
+  esac
+done
+
+# 默认两个都跑
+if [[ ${#TARGETS[@]} -eq 0 ]]; then
+  TARGETS=(chore-runner chore-monitor)
+fi
+
+# ── 安全检查 1: 自杀防御（spawn 模式 only；--reload 不 kill ${CLI_CMD} 安全）──
+# 用 $TMUX_PANE 拿"本 bash 实际所在 pane"而不是 client active session（后者可能被用户切走）
+if (( RELOAD == 0 )); then
+  if [[ -n "${TMUX_PANE:-}" ]]; then
+    CURRENT_SESSION=$(tmux display-message -p -t "$TMUX_PANE" '#{session_name}' 2>/dev/null || echo "")
+  else
+    CURRENT_SESSION=""
+  fi
+  for t in "${TARGETS[@]}"; do
+    if [[ "$CURRENT_SESSION" == "$t" ]]; then
+      cat >&2 <<EOF
+❌ 自杀防御：你正在 $t session 里跑 restart-chore $t（spawn 模式）
+   第 2 步 tmux kill-session 会杀掉自己。
+
+   正确姿势（任选其一）：
+   1. 切到 ${BUTLER_SESSION} (管家) / 其它 session 跑：restart-chore $t
+   2. 在 chore-runner 里跑 --reload 模式（不 kill ${CLI_CMD} 安全）：
+      restart-chore --reload $t
+EOF
+      exit 1
+    fi
+  done
+fi
+
+# ── 安全检查 2: sentinel daemon 在跑（spawn 模式 only）──
+if (( RELOAD == 0 )); then
+  if ! sentinel status 2>&1 | grep -q "daemon 在跑"; then
+    echo "⚠️ sentinel daemon 没在跑，先 start..."
+    sentinel start || {
+      echo "❌ sentinel daemon 起不来，看 /tmp/sentinel-daemon.log" >&2
+      exit 1
+    }
+  fi
+fi
+
+# ── helper: spawn_chore <name> —— 完整 11 步 in-place 重启 ──
+spawn_chore() {
+  local name="$1"
+  local prompt="${PROMPT_PATH[$name]:-}"
+  if [[ -z "$prompt" || ! -f "$prompt" ]]; then
+    echo "❌ prompt 模板不存在: $prompt" >&2
+    return 1
+  fi
+
+  echo "=== 重启 $name ==="
+
+  # Step 1: sentinel unregister 防 race
+  sentinel unregister "$name" 2>/dev/null || true
+
+  # Step 2: tmux kill-session
+  if tmux has-session -t "$name" 2>/dev/null; then
+    tmux kill-session -t "$name"
+    echo "💀 killed $name"
+    sleep 1
+  else
+    echo "ℹ️ session $name 不存在，新建"
+  fi
+
+  # Step 3: tmux new-session（独立 session，一任务一 session 模型）
+  tmux new-session -d -s "$name" -c "${PROJECT_ROOT}"
+
+  # Step 4: send "${CLI_CMD}"
+  tmux send-keys -t "$name:0" "${CLI_CMD}" Enter
+
+  # Step 5: poll ❯ prompt
+  echo "  ⏳ 等 ${CLI_CMD} 起来（30s timeout）..."
+  local ready=0
+  for i in $(seq 1 30); do
+    if tmux capture-pane -t "$name:0" -p -S -5 2>/dev/null | grep -q '❯'; then
+      ready=1
+      break
+    fi
+    sleep 1
+  done
+  if [[ $ready -eq 0 ]]; then
+    echo "❌ ${CLI_CMD} 启动超时（30s 未见 ❯）：$name" >&2
+    return 2
+  fi
+
+  # Step 6: /rename
+  tmux send-keys -t "$name:0" "/rename $name" Enter
+  sleep 2
+
+  # Step 7-9: load-buffer + paste-buffer + Enter
+  tmux load-buffer "$prompt"
+  tmux paste-buffer -t "$name:0"
+  sleep 1
+  tmux send-keys -t "$name:0" Enter
+  echo "📋 prompt 注入完成（$prompt，$(wc -l < "$prompt") 行）"
+
+  # Step 10: sentinel register
+  sentinel register "$name:0" self-autobatch 5 30
+  echo "🛡️ sentinel registered"
+
+  # Step 11: verify + RSS / etime 报告
+  sleep 2
+  local tty=$(tmux list-panes -t "$name:0" -F '#{pane_tty}' 2>/dev/null | head -1)
+  local tty_short=${tty#/dev/}
+  local pid=""
+  if [[ -n "$tty_short" ]]; then
+    pid=$(ps -t "$tty_short" -o pid=,comm= 2>/dev/null | awk '$2=="claude"{print $1; exit}')
+    if [[ -z "$pid" ]]; then
+      pid=$(ps -t "$tty_short" -o pid=,args= 2>/dev/null | awk '/claude/{print $1; exit}')
+    fi
+  fi
+  if [[ -n "$pid" ]]; then
+    local rss=$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ')
+    local etime=$(ps -o etime= -p "$pid" 2>/dev/null | tr -d ' ')
+    local rss_mb=$((rss/1024))
+    echo "✅ $name restarted (pid=$pid rss=${rss_mb}MB etime=$etime)"
+  else
+    echo "✅ $name restarted (pid 未抓到，可能 ${CLI_CMD} 还在 boot)"
+  fi
+  echo ""
+}
+
+# ── helper: reload_chore <name> —— tpush 重读 prompt（不 kill ${CLI_CMD}）──
+reload_chore() {
+  local name="$1"
+  local prompt="${PROMPT_PATH[$name]:-}"
+  if [[ -z "$prompt" || ! -f "$prompt" ]]; then
+    echo "❌ prompt 模板不存在: $prompt" >&2
+    return 1
+  fi
+
+  local reload_file="/tmp/restart-chore-reload-$name.md"
+  cat > "$reload_file" <<EOF
+请重读 $prompt 拿最新 prompt 规则（restart-chore --reload 模式 push 进来的）。
+读完一句话报"$name reloaded ✅"即可，不用解释做了啥变更（你重读后自动按新规则跑）。
+EOF
+
+  if tpush "$name" "$reload_file" --force; then
+    echo "✅ $name reload pushed (${CLI_CMD} 收到后会重读 prompt 模板)"
+  else
+    echo "❌ tpush $name 失败（看上面错误）" >&2
+    return 3
+  fi
+  echo ""
+}
+
+# ── 主循环 ──
+for t in "${TARGETS[@]}"; do
+  if (( RELOAD == 1 )); then
+    reload_chore "$t"
+  else
+    spawn_chore "$t"
+  fi
+done
+
+# ── 完工 verify ──
+if (( RELOAD == 0 )); then
+  echo "=== verify ==="
+  echo "--- tmux sessions ---"
+  tmux list-sessions 2>/dev/null | grep -E "$(IFS='|'; echo "${TARGETS[*]}")" || echo "(无匹配 session)"
+  echo ""
+  echo "--- sentinel list ---"
+  sentinel list 2>/dev/null | grep -E "$(IFS='|'; echo "${TARGETS[*]}")" || echo "(无匹配 entry)"
+fi
+
+echo ""
+mode=$([ $RELOAD -eq 1 ] && echo reload || echo spawn)
+echo "✅ restart-chore 完成（targets: ${TARGETS[*]}, mode: $mode）"

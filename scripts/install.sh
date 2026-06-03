@@ -94,6 +94,11 @@ inline_launcher sshfs-check               ${PROJECT_ROOT}/scripts/sshfs-check
 # daemon / keeper 本身常驻进程，不装 launcher（用绝对路径 spawn）；只装 CLI launcher
 install_launcher sentinel                 ${PROJECT_ROOT}/scripts/sentinel
 
+# ---- service worker in-place 重启 ----
+# 用途：chore-runner / chore-monitor hot context 太大 / prompt 模板改了想重 load 时
+#       一行 restart-chore 替代手敲 11 步 tmux 序列。--reload 模式不 kill ${CLI_CMD} 安全
+install_launcher restart-chore            ${PROJECT_ROOT}/scripts/restart-chore
+
 # ---- API curl wrapper（opt-in，仅 INSTALL_XHMAPI=1 时装）----
 # 用途：worker 一行 curl 测后端 REST API（含 token 自动管理）
 # 业务相关，不强装；不做 REST API 项目可永远不开
