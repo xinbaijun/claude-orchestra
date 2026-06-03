@@ -1,0 +1,354 @@
+#!/bin/bash
+# sentinel — 统一监督 daemon 管理 CLI（配套 sentinel-daemon + sentinel-daemon-keeper）
+#
+# 用途：取代散在多处的 N 个 watchdog-light bash 进程为单 daemon + watchlist。
+#       worker 撞权限框时 daemon 自动 push 通知给监督者（chore-monitor / manager / self-autobatch）。
+#
+# 用法：
+#   sentinel start                                            # 起 keeper (nohup) → keeper spawn daemon
+#   sentinel stop                                             # 写 STOP_FLAG + 停 keeper + daemon
+#   sentinel restart                                          # 重启 keeper + daemon
+#   sentinel status                                           # 看 keeper + daemon 双 PID + uptime + entries
+#
+#   sentinel register <session> <target> [interval] [throttle]
+#                                                            # 加 entry 到 watchlist
+#                                                            # target: chore-monitor / self-autobatch / manager
+#                                                            # interval 默认 8s (chore-monitor 路由) / 5s (self-autobatch) / 8s (manager)
+#                                                            # throttle 默认 60s
+#   sentinel unregister <session>                            # 移除 entry
+#   sentinel set-freq <session> <new-freq-sec>               # 调 entry 的 scan_freq_sec（自适应频率用）
+#                                                            # daemon 5s 内自动 pick up（watchlist 重读机制）
+#   sentinel list                                            # 列 watchlist entries
+#
+#   sentinel log [N]                                         # tail -N /tmp/sentinel-daemon.log（默认 20）
+#   sentinel events                                          # 列出最近 handled 撞框（events.json）
+#
+# Exit codes:
+#   0  成功
+#   1  参数错 / 命令未知
+#   2  daemon 状态异常（start 失败 / stop 时不在跑）
+#   3  watchlist 操作失败
+
+set -uo pipefail
+
+WATCHLIST=/var/run/sentinel-watchlist.json
+EVENTS=/tmp/sentinel-events.json
+LOG=/tmp/sentinel-daemon.log
+PIDFILE=/var/run/sentinel-daemon.pid
+DAEMON=${PROJECT_ROOT}/scripts/sentinel-daemon
+KEEPER=${PROJECT_ROOT}/scripts/sentinel-daemon-keeper
+KEEPER_PIDFILE=/var/run/sentinel-keeper.pid
+STOP_FLAG=/var/run/sentinel.stop
+
+# ── 工具依赖检查 ────────────────────────
+for tool in jq flock tmux; do
+  if ! command -v $tool >/dev/null 2>&1; then
+    echo "❌ 缺工具: $tool" >&2
+    exit 1
+  fi
+done
+
+# ── helper：检测 daemon 是否在跑 ─────
+daemon_alive() {
+  [[ -f "$PIDFILE" ]] || return 1
+  local pid
+  pid=$(cat "$PIDFILE" 2>/dev/null || echo 0)
+  [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
+}
+
+# ── helper：检测 keeper 是否在跑 ─────
+keeper_alive() {
+  [[ -f "$KEEPER_PIDFILE" ]] || return 1
+  local pid
+  pid=$(cat "$KEEPER_PIDFILE" 2>/dev/null || echo 0)
+  [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
+}
+
+# ── helper：取 PID 的 uptime（etime 格式）──
+pid_uptime() {
+  local pid="$1"
+  ps -o etime= -p "$pid" 2>/dev/null | xargs
+}
+
+# ── helper：初始化 watchlist（首次 / 损坏时重建）──
+init_watchlist() {
+  mkdir -p /var/run
+  # 非空 + 合法 JSON 才跳过；否则重建
+  if [[ ! -s "$WATCHLIST" ]] || ! jq empty "$WATCHLIST" 2>/dev/null; then
+    cat > "$WATCHLIST" <<'EOF'
+{"version": 1, "polling_tick_ms": 1000, "entries": []}
+EOF
+  fi
+}
+
+# ── 子命令 ────────────────────────────
+
+cmd_start() {
+  if keeper_alive; then
+    echo "✅ keeper 已在跑 pid=$(cat $KEEPER_PIDFILE)"
+    if daemon_alive; then
+      echo "✅ daemon 也在 pid=$(cat $PIDFILE)"
+    else
+      echo "ℹ️ daemon 暂不在（keeper 应 ≤5s respawn）"
+    fi
+    return 0
+  fi
+
+  # 旧架构遗留：daemon 在但 keeper 不在 → 先 kill 旧 daemon（防 keeper 起 daemon 时被 pidfile 拦）
+  if daemon_alive; then
+    local opid
+    opid=$(cat "$PIDFILE")
+    echo "ℹ️ 检测到孤立 daemon pid=$opid（旧架构遗留），先 kill"
+    kill -TERM "$opid" 2>/dev/null
+    sleep 1
+    kill -0 "$opid" 2>/dev/null && kill -KILL "$opid" 2>/dev/null
+    rm -f "$PIDFILE"
+  fi
+
+  # 清 stale STOP_FLAG（防上次 stop 没清干净）
+  rm -f "$STOP_FLAG"
+  init_watchlist
+  nohup bash "$KEEPER" >> "$LOG" 2>&1 &
+  local kpid=$!
+  disown 2>/dev/null || true
+  sleep 2
+  if kill -0 "$kpid" 2>/dev/null; then
+    echo "✅ keeper 起来 pid=$kpid (log: $LOG)"
+    sleep 1
+    if daemon_alive; then
+      echo "✅ daemon 已被 keeper spawn pid=$(cat $PIDFILE)"
+    else
+      echo "ℹ️ daemon 起步中（keeper 第一次 spawn，可能还在 init 阶段）"
+    fi
+  else
+    echo "❌ keeper 起失败，看 log: $LOG" >&2
+    tail -5 "$LOG" >&2
+    exit 2
+  fi
+}
+
+cmd_stop() {
+  local any=0
+  if ! keeper_alive && ! daemon_alive; then
+    echo "ℹ️ keeper / daemon 都没在跑"
+    rm -f "$STOP_FLAG"
+    return 0
+  fi
+
+  # 1. 写 STOP_FLAG（防 keeper 在 daemon 退出后立刻 respawn）
+  touch "$STOP_FLAG"
+  echo "✅ STOP_FLAG 已写"
+
+  # 2. SIGTERM keeper（先 keeper，触发 keeper trap 也会 kill daemon）
+  if keeper_alive; then
+    local kpid
+    kpid=$(cat "$KEEPER_PIDFILE")
+    kill -TERM "$kpid" 2>/dev/null && echo "✅ SIGTERM keeper pid=$kpid"
+    any=1
+  fi
+
+  # 3. SIGTERM daemon（兜底 — keeper 没接住时直杀 daemon）
+  if daemon_alive; then
+    local dpid
+    dpid=$(cat "$PIDFILE")
+    kill -TERM "$dpid" 2>/dev/null && echo "✅ SIGTERM daemon pid=$dpid"
+    any=1
+  fi
+
+  # 4. 等 5s 验证退
+  sleep 5
+
+  if keeper_alive; then
+    local kpid
+    kpid=$(cat "$KEEPER_PIDFILE")
+    echo "⚠️ keeper 没退，发 SIGKILL pid=$kpid"
+    kill -KILL "$kpid" 2>/dev/null
+    rm -f "$KEEPER_PIDFILE"
+  fi
+  if daemon_alive; then
+    local dpid
+    dpid=$(cat "$PIDFILE")
+    echo "⚠️ daemon 没退，发 SIGKILL pid=$dpid"
+    kill -KILL "$dpid" 2>/dev/null
+    rm -f "$PIDFILE"
+  fi
+
+  # 5. 清 STOP_FLAG（keeper trap 通常已清，但兜底 idempotent）
+  rm -f "$STOP_FLAG"
+  echo "✅ 全部已停 + STOP_FLAG 已清"
+}
+
+cmd_restart() {
+  cmd_stop
+  sleep 1
+  cmd_start
+}
+
+cmd_status() {
+  if keeper_alive; then
+    local kpid
+    kpid=$(cat "$KEEPER_PIDFILE")
+    echo "✅ keeper 在跑 pid=$kpid uptime=$(pid_uptime $kpid)"
+  else
+    echo "❌ keeper 没在跑"
+  fi
+  if daemon_alive; then
+    local dpid
+    dpid=$(cat "$PIDFILE")
+    echo "✅ daemon 在跑 pid=$dpid uptime=$(pid_uptime $dpid)"
+  else
+    echo "❌ daemon 没在跑"
+  fi
+  if [[ -f "$STOP_FLAG" ]]; then
+    echo "⚠️ STOP_FLAG 存在（stop 进行中或未清干净）"
+  fi
+  echo ""
+  echo "=== watchlist entries ==="
+  if [[ -f "$WATCHLIST" ]]; then
+    jq -r '.entries[] | "\(.session) → \(.supervisor_target) (freq=\(.scan_freq_sec)s throttle=\(.throttle_sec)s registered=\(.registered_at))"' "$WATCHLIST" 2>/dev/null
+    echo "  共 $(jq '.entries | length' "$WATCHLIST") 条"
+  else
+    echo "  (watchlist 不存在)"
+  fi
+  echo ""
+  echo "=== log 末 5 行 ==="
+  tail -5 "$LOG" 2>/dev/null || echo "  (log 不存在)"
+}
+
+cmd_register() {
+  local session="${1:?用法: sentinel register <session> <target> [interval] [throttle]}"
+  local target="${2:?用法: sentinel register <session> <target> [interval] [throttle]}"
+  local interval="${3:-8}"
+  local throttle="${4:-60}"
+
+  case "$target" in
+    chore-monitor|self-autobatch|manager) ;;
+    *)
+      echo "❌ 未知 target: $target（必须 chore-monitor / self-autobatch / manager）" >&2
+      exit 1
+      ;;
+  esac
+
+  init_watchlist
+  local now
+  now=$(date '+%Y-%m-%d %H:%M')
+
+  # flock + jq atomic update
+  (
+    flock -x 200
+    local tmp
+    tmp=$(mktemp /tmp/sentinel-watchlist-XXXXXX.json)
+    jq --arg s "$session" --arg t "$target" --argjson f "$interval" --argjson th "$throttle" --arg now "$now" '
+      .entries |= (map(select(.session != $s))) |
+      .entries += [{
+        session: $s,
+        supervisor_target: $t,
+        scan_freq_sec: $f,
+        throttle_sec: $th,
+        registered_at: $now
+      }]
+    ' "$WATCHLIST" > "$tmp" && mv "$tmp" "$WATCHLIST"
+  ) 200>"$WATCHLIST.lock"
+
+  echo "✅ registered $session → $target (freq=${interval}s throttle=${throttle}s)"
+
+  # keeper 没跑 → 自动 start（含 daemon spawn）
+  if ! keeper_alive; then
+    echo "ℹ️ keeper 没在跑，自动 start..."
+    cmd_start
+  fi
+}
+
+cmd_unregister() {
+  local session="${1:?用法: sentinel unregister <session>}"
+  init_watchlist
+
+  (
+    flock -x 200
+    local tmp
+    tmp=$(mktemp /tmp/sentinel-watchlist-XXXXXX.json)
+    jq --arg s "$session" '.entries |= map(select(.session != $s))' "$WATCHLIST" > "$tmp" && mv "$tmp" "$WATCHLIST"
+  ) 200>"$WATCHLIST.lock"
+
+  echo "✅ unregistered $session（daemon 下次重读 watchlist 5s 内生效）"
+}
+
+cmd_set_freq() {
+  local session="${1:?用法: sentinel set-freq <session> <new-freq-sec>}"
+  local new_freq="${2:?用法: sentinel set-freq <session> <new-freq-sec>}"
+
+  # 参数 validation：freq 必须正整数 1-3600
+  if ! [[ "$new_freq" =~ ^[0-9]+$ ]] || (( new_freq < 1 || new_freq > 3600 )); then
+    echo "❌ freq 必须正整数 1-3600（输入 $new_freq）" >&2
+    exit 1
+  fi
+
+  init_watchlist
+
+  # 检测 entry 存在
+  local exists
+  exists=$(jq --arg s "$session" '.entries | map(select(.session == $s)) | length' "$WATCHLIST" 2>/dev/null)
+  if [[ "$exists" != "1" ]]; then
+    echo "❌ $session 不在 watchlist（用 sentinel list 看现有 entries）" >&2
+    exit 3
+  fi
+
+  # flock + jq atomic update
+  (
+    flock -x 200
+    local tmp
+    tmp=$(mktemp /tmp/sentinel-watchlist-XXXXXX.json)
+    jq --arg s "$session" --argjson f "$new_freq" '
+      .entries |= map(if .session == $s then .scan_freq_sec = $f else . end)
+    ' "$WATCHLIST" > "$tmp" && mv "$tmp" "$WATCHLIST"
+  ) 200>"$WATCHLIST.lock"
+
+  echo "✅ set-freq $session → ${new_freq}s（daemon 下次重读 watchlist 5s 内生效）"
+}
+
+cmd_list() {
+  init_watchlist
+  jq -r '.entries[] | "\(.session) | \(.supervisor_target) | freq=\(.scan_freq_sec)s | throttle=\(.throttle_sec)s | registered=\(.registered_at)"' "$WATCHLIST" 2>/dev/null
+  local n
+  n=$(jq '.entries | length' "$WATCHLIST" 2>/dev/null || echo 0)
+  echo "共 $n 条 entries"
+}
+
+cmd_log() {
+  local n="${1:-20}"
+  if [[ -f "$LOG" ]]; then
+    tail -n "$n" "$LOG"
+  else
+    echo "(log 不存在)"
+  fi
+}
+
+cmd_events() {
+  if [[ -f "$EVENTS" ]]; then
+    jq -r 'to_entries[] | "\(.key) | hash=\(.value.hash) | ts=\(.value.ts | strftime("%Y-%m-%d %H:%M:%S"))"' "$EVENTS" 2>/dev/null || cat "$EVENTS"
+  else
+    echo "(events.json 不存在)"
+  fi
+}
+
+# ── 入口 ────────────────────────────────
+cmd="${1:-status}"
+shift 2>/dev/null || true
+
+case "$cmd" in
+  start)      cmd_start ;;
+  stop)       cmd_stop ;;
+  restart)    cmd_restart ;;
+  status)     cmd_status ;;
+  register)   cmd_register "$@" ;;
+  unregister) cmd_unregister "$@" ;;
+  set-freq)   cmd_set_freq "$@" ;;
+  list)       cmd_list ;;
+  log)        cmd_log "$@" ;;
+  events)     cmd_events ;;
+  *)
+    echo "未知子命令: $cmd" >&2
+    echo "用法: sentinel {start|stop|restart|status|register|unregister|set-freq|list|log|events}" >&2
+    exit 1
+    ;;
+esac

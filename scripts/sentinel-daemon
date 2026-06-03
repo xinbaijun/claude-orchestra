@@ -1,0 +1,388 @@
+#!/bin/bash
+# sentinel-daemon — 统一监督 daemon
+# 取代散在多处的 N 个 watchdog-light bash 进程 + butler-helper-5s 永久版。
+
+set -uo pipefail
+
+WATCHLIST=/var/run/sentinel-watchlist.json
+EVENTS=/tmp/sentinel-events.json
+LOG=/tmp/sentinel-daemon.log
+PIDFILE=/var/run/sentinel-daemon.pid
+
+for tool in jq flock sha1sum tmux; do
+  if ! command -v $tool >/dev/null 2>&1; then
+    echo "❌ 缺工具: $tool" >&2
+    exit 1
+  fi
+done
+
+mkdir -p /var/run
+if [[ ! -s "$WATCHLIST" ]] || ! jq empty "$WATCHLIST" 2>/dev/null; then
+  cat > "$WATCHLIST" <<'EOF'
+{"version": 1, "polling_tick_ms": 1000, "entries": []}
+EOF
+fi
+if [[ ! -s "$EVENTS" ]] || ! jq empty "$EVENTS" 2>/dev/null; then
+  echo '{}' > "$EVENTS"
+fi
+touch "$LOG"
+
+if [[ -f "$PIDFILE" ]]; then
+  old_pid=$(cat "$PIDFILE" 2>/dev/null || echo 0)
+  if [[ -n "$old_pid" ]] && kill -0 "$old_pid" 2>/dev/null; then
+    echo "❌ daemon 已在跑 pid=$old_pid（如要重启用 sentinel restart）" >&2
+    exit 1
+  fi
+fi
+echo $$ > "$PIDFILE"
+
+log_line() {
+  printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >> "$LOG"
+}
+
+# sshfs_healthy — source 公共库
+# 默认检 ${PROJECT_ROOT}（覆盖到 sshfs 挂载点）+ timeout 2 ls 防 hang
+source ${PROJECT_ROOT}/scripts/sshfs_healthy.sh
+
+# fail-fast 自愈阈值（治 sshfs 死 → daemon flock 死扛长时间无人监督案例）
+# 主循环连续 N 次 sshfs unhealthy / read_watchlist 失败 → exit 99 让 keeper respawn 拿新 fd
+# 阈值取小（10-12s 内自杀）让无人监督窗口短；keeper respawn_delay 防 fork bomb
+SSHFS_FAIL_THRESHOLD=5      # sshfs 连续 5 次 unhealthy 自杀（× SSHFS_RETRY_SLEEP=2s = ~10s）
+SSHFS_RETRY_SLEEP=2         # sshfs unhealthy 时 retry 间隔（覆盖原 sleep 29 graceful pause）
+FLOCK_FAIL_THRESHOLD=10     # watchlist read 连续 10 次失败自杀（read 节流 5s 间隔 = ~50s 实际）
+
+SSHFS_PAUSED=0          # 1 = 上轮检测断了 graceful pause 中
+SSHFS_FAIL_COUNT=0      # sshfs 连续 unhealthy 计数
+FLOCK_FAIL_COUNT=0      # read_watchlist 连续失败计数
+
+cleanup() {
+  log_line "daemon SIGTERM/EXIT，清理 pidfile pid=$$"
+  rm -f "$PIDFILE"
+  exit 0
+}
+trap cleanup TERM INT EXIT
+
+log_line "daemon 启动 pid=$$ watchlist=$WATCHLIST"
+
+PERM_FRAME_REGEX='Do you want to proceed\?|Yes, and don.t ask again|Yes, allow all edits during this session|❯[[:space:]]+1\.[[:space:]]Yes|❯[[:space:]]+2\.[[:space:]]No'
+
+# resolve_target — 输入 session 名（或 session:window 形式），输出实际 tmux target
+# 模板用一任务一 session 模式，所以独立 session 模式优先；保留 session:window 直通
+resolve_target() {
+  local input="$1"
+  if [[ "$input" == *:* ]]; then
+    echo "$input"
+    return 0
+  fi
+  if tmux has-session -t "$input" 2>/dev/null; then
+    echo "$input"
+    return 0
+  fi
+  echo "$input"
+  return 1
+}
+
+declare -A ENTRY_TARGET
+declare -A ENTRY_FREQ
+declare -A ENTRY_THROTTLE
+declare -A ENTRY_LAST_SCAN
+WATCHLIST_LAST_READ=0
+
+read_watchlist() {
+  local raw
+  raw=$(flock -s 200 jq -c '.entries' "$WATCHLIST" 200>"$WATCHLIST.lock") || {
+    log_line "⚠️ 读 watchlist 失败 skip"
+    return 1
+  }
+  ENTRY_TARGET=()
+  ENTRY_FREQ=()
+  ENTRY_THROTTLE=()
+  local entry session target freq throttle
+  while IFS= read -r entry; do
+    session=$(jq -r '.session' <<< "$entry")
+    target=$(jq -r '.supervisor_target' <<< "$entry")
+    freq=$(jq -r '.scan_freq_sec' <<< "$entry")
+    throttle=$(jq -r '.throttle_sec' <<< "$entry")
+    ENTRY_TARGET["$session"]="$target"
+    ENTRY_FREQ["$session"]="$freq"
+    ENTRY_THROTTLE["$session"]="$throttle"
+  done < <(echo "$raw" | jq -c '.[]')
+  WATCHLIST_LAST_READ=$(date +%s)
+  log_line "watchlist 重读：${#ENTRY_TARGET[@]} entries [${!ENTRY_TARGET[*]}]"
+}
+
+handle_frame() {
+  local session="$1"
+  local target="$2"
+  local tail="$3"
+  local now="$4"
+
+  local hash
+  hash=$(echo "$tail" | sha1sum | cut -c1-12)
+
+  local last_hash last_ts diff throttle
+  last_hash=$(jq -r --arg s "$session" '.[$s].hash // ""' "$EVENTS" 2>/dev/null)
+  last_ts=$(jq -r --arg s "$session" '.[$s].ts // 0' "$EVENTS" 2>/dev/null)
+  throttle="${ENTRY_THROTTLE[$session]}"
+  if [[ "$hash" == "$last_hash" ]]; then
+    diff=$(( now - last_ts ))
+    if (( diff < throttle )); then
+      log_line "skip $session 同框节流中 (${diff}s < ${throttle}s)"
+      return
+    fi
+  fi
+
+  local cmd_summary
+  cmd_summary=$(echo "$tail" | grep -E '^\s*❯' | tail -1 | sed 's/^[[:space:]]*//' | cut -c1-80)
+  [[ -z "$cmd_summary" ]] && cmd_summary="(未提到命令摘要)"
+  local ts_short
+  ts_short=$(date '+%H:%M')
+
+  case "$target" in
+    chore-monitor)
+      # 撞框计数器（治 ${CLI_CMD} parser quirk 误触 chore-monitor 杂活）
+      # 同 hash → count++；不同 hash → 重置 1。count < 2 silent 观察一轮，第 2+ 次才推 chore-monitor。
+      # 防 ${CLI_CMD} 一次性短暂自纠 quirk（capture-pane 在异步过渡瞬间瞎抓"❯ 1." 假阳性）误触 chore-monitor 一遍杂活。
+      local last_count new_count
+      last_count=$(jq -r --arg s "$session" '.[$s].count // 0' "$EVENTS" 2>/dev/null)
+      if [[ "$hash" == "$last_hash" ]]; then
+        new_count=$(( last_count + 1 ))
+      else
+        new_count=1
+      fi
+
+      if (( new_count < 2 )); then
+        log_line "skip chore-monitor: $session 撞框第 ${new_count} 次（silent 观察，下次撞同框才推） \"$cmd_summary\""
+        local tmp_cm
+        tmp_cm=$(mktemp /tmp/sentinel-events-XXXXXX.json)
+        jq --arg s "$session" --arg h "$hash" --argjson ts "$now" --argjson c "$new_count" \
+           '.[$s] = {hash: $h, ts: $ts, count: $c}' "$EVENTS" > "$tmp_cm" 2>/dev/null && mv "$tmp_cm" "$EVENTS"
+        return
+      fi
+
+      local monitor_target
+      monitor_target=$(resolve_target "chore-monitor") || {
+        log_line "⚠️ chore-monitor target 不存在（不是独立 session），skip"
+        return
+      }
+      local msg="📛 $session 撞权限框：$cmd_summary 时间 $ts_short（已撞 ${new_count} 次）"
+      local tmpf
+      tmpf=$(mktemp /tmp/sentinel-notify-XXXXXX.txt)
+      printf '%s' "$msg" > "$tmpf"
+      tmux load-buffer "$tmpf" 2>/dev/null
+      rm -f "$tmpf"
+      tmux paste-buffer -t "$monitor_target" 2>/dev/null
+      sleep 0.5
+      tmux send-keys -t "$monitor_target" Enter 2>/dev/null
+      log_line "→ chore-monitor ($monitor_target): $session 撞 \"$cmd_summary\" (第 ${new_count} 次)"
+
+      local tmp_cm
+      tmp_cm=$(mktemp /tmp/sentinel-events-XXXXXX.json)
+      jq --arg s "$session" --arg h "$hash" --argjson ts "$now" --argjson c "$new_count" \
+         '.[$s] = {hash: $h, ts: $ts, count: $c}' "$EVENTS" > "$tmp_cm" 2>/dev/null && mv "$tmp_cm" "$EVENTS"
+      return
+      ;;
+    self-autobatch)
+      local self_target
+      self_target=$(resolve_target "$session") || {
+        log_line "⚠️ self-autobatch target $session 不存在，skip"
+        return
+      }
+      tmux send-keys -t "$self_target" Enter 2>/dev/null
+      log_line "→ self-autobatch ($self_target): $session 傻批 \"$cmd_summary\""
+      ;;
+    manager)
+      local msg="📛 $session 撞框：$cmd_summary 时间 $ts_short（sentinel manager 路由）"
+      local tmpf
+      tmpf=$(mktemp /tmp/sentinel-notify-XXXXXX.txt)
+      printf '%s' "$msg" > "$tmpf"
+      tmux load-buffer "$tmpf" 2>/dev/null
+      rm -f "$tmpf"
+      tmux paste-buffer -t ${BUTLER_SESSION} 2>/dev/null
+      sleep 0.5
+      tmux send-keys -t ${BUTLER_SESSION} Enter 2>/dev/null
+      log_line "→ manager: $session 撞 \"$cmd_summary\""
+      ;;
+    *)
+      log_line "⚠️ 未知 target=$target for session=$session，skip"
+      return
+      ;;
+  esac
+
+  local tmp
+  tmp=$(mktemp /tmp/sentinel-events-XXXXXX.json)
+  jq --arg s "$session" --arg h "$hash" --argjson ts "$now" \
+     '.[$s] = {hash: $h, ts: $ts}' "$EVENTS" > "$tmp" 2>/dev/null && mv "$tmp" "$EVENTS"
+}
+
+# check_notifications — 监视 notifications.md 新 entry，tpush ${BUTLER_SESSION}
+# 弥补 service worker（chore-runner / chore-monitor）+ 偶尔 worker 自己 commit 后不响 BEL 导致管家漏看完工通知。
+# 不用 inotify（sshfs FUSE 上不稳）—— 用 stat mtime 比对 + awk grep 顶部新 entry。
+# state 文件 /tmp/sentinel-notif-lastseen.line 存上次顶部 entry full text。
+# 首次跑（state 不存在）写当前顶部不 push（防历史洪水）。
+# self-trigger 防护：state mtime 同步 notif mtime，下一轮 mtime_now <= mtime_seen 短路 return；
+# sentinel 自己 push notif 后这条 entry 也会被检测到再 push 一次（自报上线，可接受）。
+check_notifications() {
+  local notif=${PROJECT_ROOT}/docs/ai-workflow/notifications.md
+  local state=/tmp/sentinel-notif-lastseen.line
+
+  # sshfs 健康检测复用现有 helper（主循环已 short-circuit，这里冗余防御）
+  if ! sshfs_healthy; then
+    return 0
+  fi
+
+  # mtime 短路：notif 没变直接 return（每秒跑成本一次 stat call）
+  if [ -f "$state" ]; then
+    local mtime_now mtime_seen
+    mtime_now=$(stat -c %Y "$notif" 2>/dev/null)
+    mtime_seen=$(stat -c %Y "$state" 2>/dev/null)
+    if [ -n "$mtime_now" ] && [ -n "$mtime_seen" ] && [ "$mtime_now" -le "$mtime_seen" ]; then
+      return 0
+    fi
+  fi
+
+  # 拿当前顶部第一条 entry full line（必须在「## 通知流」段内，跳过「举例」段的示例）
+  local current_top
+  current_top=$(awk '
+    /^## 通知流/ { in_notif = 1; next }
+    in_notif && /^- [0-9]{4}-[0-9]{2}-[0-9]{2}/ { print; exit }
+  ' "$notif" 2>/dev/null)
+  if [ -z "$current_top" ]; then
+    return 0
+  fi
+
+  # 首次跑（state 文件不存在）— 写当前 top 不 push（防历史洪水）
+  if [ ! -f "$state" ]; then
+    echo "$current_top" > "$state"
+    touch -r "$notif" "$state"
+    log_line "notif-watch: 初始化 state，跳过历史 push"
+    return 0
+  fi
+
+  local lastseen
+  lastseen=$(cat "$state")
+  if [ "$current_top" = "$lastseen" ]; then
+    # 顶部 entry 没变（mtime 变了但内容一样，如 git pull / 文件 touch）— 更新 state mtime
+    touch -r "$notif" "$state"
+    return 0
+  fi
+
+  # 有新 entry — 拿从 lastseen 到 current 之间所有新行（最新在上；同样只在通知流段内）
+  # 用 found flag 区分两种 case：
+  #   (a) 扫到 lastseen → 输出之前 collected 的所有新行（正常 case）
+  #   (b) 扫完没找到 lastseen → 输出空（lastseen 被删 / 被归档 / 通知流段被 reset），由 bash 层 fallback 到 current_top only
+  # 避免"删 lastseen → daemon 把整个通知流当新 entry"的洪水 bug
+  local new_entries
+  new_entries=$(awk -v lastseen="$lastseen" '
+    /^## 通知流/ { in_notif = 1; next }
+    in_notif && /^- [0-9]{4}-[0-9]{2}-[0-9]{2}/ {
+      if ($0 == lastseen) { found = 1; exit }
+      lines[++n] = $0
+    }
+    END {
+      if (found) {
+        for (i = 1; i <= n; i++) print lines[i]
+      }
+    }
+  ' "$notif" 2>/dev/null)
+
+  if [ -z "$new_entries" ]; then
+    # lastseen 不在通知流段内（被归档 / 被删 / 段被 reset），按 1 条新条目处理
+    new_entries="$current_top"
+  fi
+
+  local count
+  count=$(echo "$new_entries" | wc -l)
+
+  # 写 push 文件（截断每条到 200 字，避免 push 过长）
+  local push_file=/tmp/butler-notif-push.txt
+  {
+    echo "📢 sentinel watch: notifications.md 新增 $count 条"
+    echo ""
+    echo "$new_entries" | head -10 | cut -c1-200
+  } > "$push_file"
+
+  # tpush ${BUTLER_SESSION}（含 Step 0 防呆，butler 卡权限框时 skip 不打扰）
+  if command -v tpush >/dev/null 2>&1; then
+    tpush ${BUTLER_SESSION} "$push_file" 2>&1 | tail -1 >> "$LOG"
+  else
+    log_line "notif-watch: tpush 不存在，跳过 push（请检查 install.sh）"
+  fi
+
+  # 更新 state
+  echo "$current_top" > "$state"
+  touch -r "$notif" "$state"
+
+  log_line "notif-watch: pushed $count new entry to ${BUTLER_SESSION}"
+}
+
+read_watchlist
+log_line "进入主循环"
+while true; do
+  sleep 1
+
+  # notifications.md 新 entry 检测（轻量 stat mtime 短路 + tpush ${BUTLER_SESSION}）
+  # function 自己 sshfs_healthy 短路 + mtime 短路，每秒跑成本 = 一次 stat call
+  check_notifications
+
+  now=$(date +%s)
+
+  # sshfs 健康检测 graceful pause + fail-fast 自杀
+  # sentinel daemon 本身不依赖 sshfs（tmux/jq/sha1sum 都本地），但 sshfs 断时帮 worker 批权限框
+  # 反而坏事 — worker ${CLI_CMD} 自己已 hang 在 Read 上，daemon 不应继续 send-keys 制造噪音
+  # fail-fast 阈值：连续 SSHFS_FAIL_THRESHOLD 次 unhealthy → exit 99 让 keeper respawn
+  if ! sshfs_healthy; then
+    SSHFS_FAIL_COUNT=$((SSHFS_FAIL_COUNT + 1))
+    if (( SSHFS_PAUSED == 0 )); then
+      log_line "⚠️ sshfs 断 — 主循环 pause (fail=$SSHFS_FAIL_COUNT/$SSHFS_FAIL_THRESHOLD)"
+      SSHFS_PAUSED=1
+    fi
+    if (( SSHFS_FAIL_COUNT >= SSHFS_FAIL_THRESHOLD )); then
+      log_line "❌ sshfs 连续 $SSHFS_FAIL_THRESHOLD 次 unhealthy（推断 FUSE stale 死锁）→ 自杀让 keeper respawn 拿新 fd"
+      exit 99
+    fi
+    sleep "$SSHFS_RETRY_SLEEP"
+    continue
+  fi
+  if (( SSHFS_PAUSED == 1 )); then
+    log_line "✅ sshfs 恢复 — 主循环 resume (after $SSHFS_FAIL_COUNT fail)"
+    SSHFS_PAUSED=0
+  fi
+  SSHFS_FAIL_COUNT=0
+
+  # read_watchlist 失败累积阈值（治 read_watchlist 失败死扛长时间案例）
+  # read_watchlist 内部 flock 失败时 return 1；连续 FLOCK_FAIL_THRESHOLD 次 → exit 99 让 keeper respawn
+  if (( now - WATCHLIST_LAST_READ >= 5 )); then
+    if read_watchlist; then
+      FLOCK_FAIL_COUNT=0
+    else
+      FLOCK_FAIL_COUNT=$((FLOCK_FAIL_COUNT + 1))
+      log_line "⚠️ read_watchlist 失败 (fail=$FLOCK_FAIL_COUNT/$FLOCK_FAIL_THRESHOLD)"
+      if (( FLOCK_FAIL_COUNT >= FLOCK_FAIL_THRESHOLD )); then
+        log_line "❌ read_watchlist 连续 $FLOCK_FAIL_THRESHOLD 次失败（推断 flock fd dangle / sshfs FUSE 副作用）→ 自杀让 keeper respawn"
+        exit 99
+      fi
+    fi
+  fi
+
+  for session in "${!ENTRY_TARGET[@]}"; do
+    freq="${ENTRY_FREQ[$session]}"
+    last_scan="${ENTRY_LAST_SCAN[$session]:-0}"
+    if (( now - last_scan < freq )); then
+      continue
+    fi
+    ENTRY_LAST_SCAN["$session"]=$now
+
+    actual_target=$(resolve_target "$session") || {
+      log_line "session $session 不存在，下次重读 watchlist 时若仍未 unregister 会刷掉 cache"
+      continue
+    }
+
+    tail=$(tmux capture-pane -t "$actual_target" -p -S -8 2>/dev/null || true)
+    [[ -z "$tail" ]] && continue
+
+    if echo "$tail" | grep -qE "$PERM_FRAME_REGEX"; then
+      handle_frame "$session" "${ENTRY_TARGET[$session]}" "$tail" "$now"
+    fi
+  done
+done

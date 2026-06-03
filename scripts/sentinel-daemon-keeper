@@ -1,0 +1,81 @@
+#!/bin/bash
+# sentinel-daemon-keeper — 永生 wrapper
+# 治"sentinel-daemon 异常 exit 没人重起"导致 worker 撞框死锁。
+#
+# 行为：
+# - forever-loop 跑 sentinel-daemon
+# - daemon 退出后 15s 自动 respawn
+# - 见 STOP_FLAG (/var/run/sentinel.stop) 时清理退出 + 不再 respawn
+# - SIGTERM/SIGINT 时优雅 kill 子 daemon + 删 pidfile + 退出
+#
+# 由 `sentinel start` 通过 nohup 起，不要直接手动跑。
+# 关键安全：不能用 exec daemon 模式（exec 替换 keeper 进程 = 失去 wrapper 效果）
+
+set -uo pipefail
+
+STOP_FLAG=/var/run/sentinel.stop
+LOG=/tmp/sentinel-daemon.log
+KEEPER_PID=/var/run/sentinel-keeper.pid
+DAEMON=${PROJECT_ROOT}/scripts/sentinel-daemon
+# respawn 间隔 15s：防 fail-fast 自愈（daemon exit 99）后立刻 respawn 又遇 sshfs unhealthy 立刻自杀的 fork bomb
+# daemon 自杀典型 case = sshfs FUSE stale，需要时间让 sshfs reconnect 或用户手动 remount；15s 足够
+RESPAWN_DELAY=15
+
+mkdir -p /var/run
+echo $$ > "$KEEPER_PID"
+touch "$LOG"
+
+DAEMON_PID=""
+
+log_line() {
+  printf '[%s] keeper: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >> "$LOG"
+}
+
+cleanup() {
+  log_line "SIGTERM/INT 收到，杀子 daemon + 退出"
+  if [[ -n "$DAEMON_PID" ]] && kill -0 "$DAEMON_PID" 2>/dev/null; then
+    kill -TERM "$DAEMON_PID" 2>/dev/null
+    sleep 1
+    if kill -0 "$DAEMON_PID" 2>/dev/null; then
+      log_line "daemon 不退，发 SIGKILL pid=$DAEMON_PID"
+      kill -KILL "$DAEMON_PID" 2>/dev/null
+    fi
+  fi
+  rm -f "$KEEPER_PID"
+  exit 0
+}
+trap cleanup TERM INT
+
+# 启动时清 stale STOP_FLAG（防上次 stop 没清干净）
+rm -f "$STOP_FLAG"
+
+log_line "启动 pid=$$ daemon=$DAEMON respawn_delay=${RESPAWN_DELAY}s"
+
+while true; do
+  if [[ -f "$STOP_FLAG" ]]; then
+    log_line "见 STOP_FLAG，清理退出"
+    rm -f "$STOP_FLAG" "$KEEPER_PID"
+    exit 0
+  fi
+
+  log_line "spawn daemon"
+  bash "$DAEMON" >> "$LOG" 2>&1 &
+  DAEMON_PID=$!
+  log_line "daemon spawned pid=$DAEMON_PID"
+
+  # wait 会被 trap 中断；正常 daemon 退出也会返回
+  wait "$DAEMON_PID"
+  rc=$?
+  log_line "daemon exit code=$rc pid=$DAEMON_PID"
+  DAEMON_PID=""
+
+  # daemon 退出后再检 STOP_FLAG（响应快，不必等 sleep）
+  if [[ -f "$STOP_FLAG" ]]; then
+    log_line "见 STOP_FLAG (daemon exit 后)，清理退出"
+    rm -f "$STOP_FLAG" "$KEEPER_PID"
+    exit 0
+  fi
+
+  log_line "${RESPAWN_DELAY}s 后 respawn"
+  sleep "$RESPAWN_DELAY"
+done

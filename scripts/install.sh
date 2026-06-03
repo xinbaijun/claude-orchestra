@@ -88,6 +88,12 @@ install_launcher board_move_to_history    ${PROJECT_ROOT}/scripts/board_move_to_
 # C.2 inline：sshfs 死时也要能跑 → inline_launcher 自包含
 inline_launcher sshfs-check               ${PROJECT_ROOT}/scripts/sshfs-check
 
+# ---- 统一监督 daemon CLI（sentinel）----
+# 用途：取代散在多处 N 个 watchdog-light bash 进程为单 daemon + watchlist；
+#       worker 撞权限框时 daemon 自动 push 通知给监督者（chore-monitor / manager）
+# daemon / keeper 本身常驻进程，不装 launcher（用绝对路径 spawn）；只装 CLI launcher
+install_launcher sentinel                 ${PROJECT_ROOT}/scripts/sentinel
+
 # ---- API curl wrapper（opt-in，仅 INSTALL_XHMAPI=1 时装）----
 # 用途：worker 一行 curl 测后端 REST API（含 token 自动管理）
 # 业务相关，不强装；不做 REST API 项目可永远不开
