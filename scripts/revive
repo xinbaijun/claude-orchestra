@@ -13,13 +13,14 @@
 #      B. A 失败兜底：grep 所有 jsonl 内容找 "Session renamed to: <name>"
 #   3. tmux new-session -d -s <name> -c ${PROJECT_ROOT}
 #   4. send-keys "${CLI_CMD} --resume <uuid>" Enter
-#   5. sleep 8 + capture-pane 验证 cc 起来了
-#   6. 检测 board 历史活跃段有该 session → 自动搬回活跃段（治板漂延迟）
+#   5. until-loop 120s 等 cc UI 出来（cc --resume 大 jsonl 通常 30-90s，原 sleep 8 会误报失败）
+#   6. 自动 sentinel register（如有 sentinel daemon；治每次 revive 后还得手动 register）
+#   7. 检测 board 状态 + 自动搬板 / 提示管家可手动 board_register
 #
 # Exit codes:
 #   0  成功
 #   1  缺参数
-#   2  session 已存在
+#   2  session 已存在 / 120s 超时 cc UI 没起来
 #   3  找不到 jsonl UUID
 
 set -euo pipefail
@@ -39,10 +40,12 @@ EOF
 fi
 
 # Step 2 路线 A: session_board.md 找 jsonl=<前 8 位>
+# || true 兜底：grep 无匹配返 1 + pipefail 会让脚本提前 exit
 prefix=$(grep -F "\`$SESSION\`" "$BOARD" 2>/dev/null | grep -oE 'jsonl=[0-9a-f]{8}' | head -1 | cut -d= -f2 || true)
 
 uuid=""
 if [[ -n "$prefix" ]]; then
+  # ls -t 按 mtime 排序最新在前；多匹配选最新 + warn
   matches=$(ls -t "$JSONL_DIR"/"$prefix"*.jsonl 2>/dev/null)
   match_count=$(echo "$matches" | grep -c . || true)
   if [[ "$match_count" -gt 1 ]]; then
@@ -56,10 +59,15 @@ if [[ -n "$prefix" ]]; then
 fi
 
 # Step 2 路线 B 兜底: grep jsonl 内容找真 rename 事件
+# 真 rename event 在 jsonl 里被 cc 包成完整 XML 标签:
+#   "<local-command-stdout>Session renamed to: <name></local-command-stdout>"
+# 用完整标签 fixed-string 匹配，避免讨论文本（如 worker 自己 jsonl
+# 里讨论 "Session renamed to: nonexistent-session-xxx" 之类）误命中
 if [[ -z "$uuid" ]]; then
   echo "ℹ️  session_board 没找到 $SESSION 的 jsonl 前 8 位，路线 B grep jsonl 真 rename 事件..." >&2
   matches=$(grep -lF "<local-command-stdout>Session renamed to: $SESSION</local-command-stdout>" "$JSONL_DIR"/*.jsonl 2>/dev/null || true)
   if [[ -n "$matches" ]]; then
+    # 多匹配选 mtime 最新
     sorted=$(echo "$matches" | xargs ls -t 2>/dev/null)
     match_count=$(echo "$sorted" | grep -c . || true)
     if [[ "$match_count" -gt 1 ]]; then
@@ -87,65 +95,101 @@ echo "🔍 找到 UUID: $uuid"
 tmux new-session -d -s "$SESSION" -c ${PROJECT_ROOT}
 tmux send-keys -t "$SESSION" "${CLI_CMD} --resume $uuid" Enter
 
-# Step 5: 等 cc resume + 验证
-echo "⏳ 等 cc 起来（8s）..."
-sleep 8
-output=$(tmux capture-pane -t "$SESSION" -p 2>/dev/null | tail -10)
+# Step 5: until-loop 等 cc UI 出来（cc --resume 大 jsonl 通常 30-90s，原 sleep 8 误报失败）
+# Pattern: cc 首屏出 `❯ Try`/`❯ Edit`/`❯ how does`/`❯ write a test` 引导文案
+# 40 × 3s = 120s 最长等，命中关键字立刻 break；超时真失败 → exit 2
+echo "⏳ 等 cc UI ready（${CLI_CMD} --resume 大 jsonl 通常需 30-90s）..."
+UI_READY=0
+for i in $(seq 1 40); do
+  if tmux capture-pane -t "$SESSION:0" -p 2>/dev/null | grep -qE '❯ Try|❯ Edit|❯ how does|❯ write a test'; then
+    echo "✅ cc UI ready after $((i * 3))s"
+    UI_READY=1
+    break
+  fi
+  sleep 3
+done
 
-if echo "$output" | grep -qF "❯"; then
-  cat <<EOF
-✅ revived $SESSION（cc 已起，hot context 应该接上了）
+if [[ "$UI_READY" -ne 1 ]]; then
+  cat >&2 <<EOF
+❌ 120s 后 cc UI 仍未出来 — 真挂了 / UUID 不对 / jsonl 损坏
+
+   tmux attach -t $SESSION 手动看 cc 卡在哪
+   capture-pane 末 15 行：
+$(tmux capture-pane -t "$SESSION:0" -p 2>/dev/null | tail -15)
+EOF
+  exit 2
+fi
+
+cat <<EOF
+✅ revived $SESSION（${CLI_CMD} 已起，hot context 应该接上了）
    attach 验证：tmux attach -t $SESSION
-   看到老对话上下文 → 成功；看到 "Welcome to Claude Code" → resume 失败 fresh cc 起了
+   看到老对话上下文 → 成功；看到 "Welcome to Claude Code" → resume 失败 fresh ${CLI_CMD} 起了
 EOF
 
-  # Step 6: 自动搬板（治板漂延迟）
-  echo ""
-  echo "🔄 检测 board 状态..."
-
-  if awk '/^## 历史活跃$/,/^---$/' "$BOARD" 2>/dev/null | grep -qE "^- 20[0-9]{2}-.*⚪ \`$SESSION\`"; then
-    echo "  历史活跃段找到 ⚪ $SESSION → 自动搬板"
-
-    NOW=$(date '+%Y-%m-%d %H:%M')
-    JSONL_SHORT="${uuid:0:8}"
-    NEW_ROW="| \`$SESSION\` | revive 救活继续（任务延续从历史段，详情见原 ⚪ 记录 git history） | $NOW | 🟢 active | revive $NOW 救活 hot context；jsonl=$JSONL_SHORT |"
-
-    # Pass 1: 删历史活跃段 ⚪ <session> 整段
-    awk -v sess="$SESSION" '
-      /^## 历史活跃$/                       { in_hist = 1; print; next }
-      /^## / && !/^## 历史活跃$/            { in_hist = 0; skipping = 0 }
-      in_hist && /^- 20[0-9]{2}-/ {
-        if (match($0, "⚪ `" sess "`")) { skipping = 1; next }
-        else                           { skipping = 0 }
-      }
-      skipping { next }
-      { print }
-    ' "$BOARD" > "$BOARD.tmp1"
-
-    # Pass 2: 表格 separator 后插新行
-    awk -v row="$NEW_ROW" '
-      /^\|---\|---\|---\|---\|---\|$/ { print; print row; next }
-      { print }
-    ' "$BOARD.tmp1" > "$BOARD.tmp2"
-
-    mv "$BOARD.tmp2" "$BOARD"
-    rm -f "$BOARD.tmp1"
-
-    # commit（cd ${PROJECT_ROOT} 保 git 跑在 repo 根目录）
-    (cd ${PROJECT_ROOT} && ${GIT_WRAPPER} add docs/ai-workflow/session_board.md && \
-       ${GIT_WRAPPER} commit -m "chore(board): $SESSION revive 后自动搬板（历史 → 活跃）")
-
-    echo "✅ board 自动搬板完成"
-  else
-    echo "  ⚠️  board 历史段没找到 $SESSION → skip 搬板（可能 board 全失踪 / 已在活跃段）"
-  fi
+# Step 6: 自动 sentinel register（如装了 sentinel daemon）
+# 治每次 revive 后管家还得手动 sentinel register
+echo ""
+echo "🔧 自动 sentinel register（chore-monitor 路由 8s/60s）..."
+if command -v sentinel >/dev/null 2>&1; then
+  sentinel register "$SESSION:0" chore-monitor 8 60 2>&1 | tail -3
 else
+  echo "ℹ️ sentinel 不在 PATH（未装监督 daemon 时跳过；要装见 scripts/sentinel）"
+fi
+
+# Step 7: 检测 board 状态 + 自动搬板 / 提示管家
+# 优先级：
+#   (a) 活跃段已有 worker 行 → OK 不动（worker 自注册了 / 历史 revive 残留）
+#   (b) 活跃段没有 + 历史段有 ⚪ <session> → 自动搬板（治板漂延迟）
+#   (c) 都没有 → 提示管家可手动调 board_register（不自己 register，task 描述用户决定）
+echo ""
+echo "🔄 检测 board 状态..."
+
+active_match=$(awk '/^## 活跃对话$/,/^## 历史活跃$/' "$BOARD" 2>/dev/null | grep -F "\`$SESSION\`" | head -1 || true)
+
+if [[ -n "$active_match" ]]; then
+  echo "  ℹ️  worker 已在 session_board 活跃段（自注册过 / 历史 revive 残留），不动 board"
+  echo "  命中行：$active_match"
+elif awk '/^## 历史活跃$/,/^---$/' "$BOARD" 2>/dev/null | grep -qE "^- 20[0-9]{2}-.*⚪ \`$SESSION\`"; then
+  echo "  历史活跃段找到 ⚪ $SESSION → 自动搬板（治板漂延迟）"
+
+  NOW=$(date '+%Y-%m-%d %H:%M')
+  JSONL_SHORT="${uuid:0:8}"
+  NEW_ROW="| \`$SESSION\` | revive 救活继续（任务延续从历史段，详情见原 ⚪ 记录 git history） | $NOW | 🟢 active | revive $NOW 救活 hot context；jsonl=$JSONL_SHORT |"
+
+  # Pass 1: 删历史活跃段 ⚪ <session> 整段（含所有缩进 / 空行延续，直到下一 `^- 20[0-9]{2}-` 顶层条目）
+  awk -v sess="$SESSION" '
+    /^## 历史活跃$/                       { in_hist = 1; print; next }
+    /^## / && !/^## 历史活跃$/            { in_hist = 0; skipping = 0 }
+    in_hist && /^- 20[0-9]{2}-/ {
+      if (match($0, "⚪ `" sess "`")) { skipping = 1; next }
+      else                           { skipping = 0 }
+    }
+    skipping { next }
+    { print }
+  ' "$BOARD" > "$BOARD.tmp1"
+
+  # Pass 2: 表格 separator (|---|---|---|---|---|) 后插新行
+  awk -v row="$NEW_ROW" '
+    /^\|---\|---\|---\|---\|---\|$/ { print; print row; next }
+    { print }
+  ' "$BOARD.tmp1" > "$BOARD.tmp2"
+
+  mv "$BOARD.tmp2" "$BOARD"
+  rm -f "$BOARD.tmp1"
+
+  # commit（cd ${PROJECT_ROOT} 保 ${GIT_WRAPPER} 跑在 repo 根目录）
+  (cd ${PROJECT_ROOT} && ${GIT_WRAPPER} add docs/ai-workflow/session_board.md && \
+     ${GIT_WRAPPER} commit -m "chore(board): $SESSION revive 后自动搬板（历史 → 活跃）")
+
+  echo "  ✅ board 自动搬板完成"
+else
+  JSONL_SHORT="${uuid:0:8}"
   cat <<EOF
-⚠️  cc 可能还在 load / 或 resume 失败，capture-pane 输出：
----
-$output
----
-   切过去手动看：tmux attach -t $SESSION
-   如果是 fresh cc UI（无 hot context）→ UUID 可能拼错 / jsonl 损坏，重选 UUID
+  ⚠️  board 上找不到 $SESSION（既不在活跃段也不在历史段）
+     不自动 register（task 描述需要用户决定），可手动调：
+     board_register $SESSION "<task description>" $JSONL_SHORT
 EOF
 fi
+
+echo ""
+echo "✅ revive 完成 — tmux attach -t $SESSION 切过去 / 或 tpush 任务给它"
