@@ -9,7 +9,7 @@
 - **Append-only**：管家做决策当下立即 Edit append 一行；**永远不修改过去条目**
 - **最新在上**：跟 `notifications.md` / `resume_here.md` 一致。读头 N 行拿最新 N 条，不需要 tail
 - **管家自己 Edit append**：append-only 单文件无 scope creep 风险，管家白名单例外允许（详见 `.claude/commands/butler.md` 顶部硬约束段）
-- **batch commit 由 chore-runner 触发**：管家 Edit 默认不 commit；累积 ≥ 3 条新决策（或距上次 commit > 2h） → `/peek` Step 6 自动派 chore-runner 顺手 commit；或用户口语显式触发
+- **commit 由 `butler_commit` bash function 触发**：管家 Edit 默认不 commit；用 `butler_commit` 一行命令落地（自检 dirty / clean 跳过）；通常 `/peek` 末段顺手调，或用户口语显式触发
 - **不归档不删 → 超 5000 行触发归档**到 `docs/_archive/butler_decisions/<start>_to_<end>.md`
 
 ## 单条格式
@@ -36,15 +36,15 @@
 | 💀 | kill | kill worker（完工 ⚪ 自动 kill / 手动 kill） |
 | 🔄 | 救活 | `revive` 把崩了的 worker 救回来 |
 | 📜 | 拍板方案 | 用户给方案 menu 后管家替/帮用户拍板 |
-| 🛠 | 改 SOP | 推动改 SOP 文档 / 工具链（派 chore-runner 落地） |
+| 🛠 | 改 SOP | 推动改 SOP 文档 / 工具链 |
 | 🚨 | 事故处理 | 紧急事件（SSH key 覆盖 / sshfs 卡 / tmux 崩等） |
 | 💬 | 教学 | 教用户业界 pattern / 操作姿势对比 |
-| 🔍 | 巡视 | /peek 跑出板漂或异常派 chore-runner 代登记 |
+| 🔍 | 巡视 | /peek 跑出板漂或异常自动 commit |
 
 **举例**：
 
 ```
-- 2026-05-20 14:50 | ⏳ | 🛠 改 SOP | 派 chore-runner 加 4 项 audit 改进（B1+A2+B2+A3）
+- 2026-05-20 14:50 | ⏳ | 🛠 改 SOP | 加 4 项 audit 改进（B1+A2+B2+A3）
 - 2026-05-20 14:30 | ✅ | 🎩 派单 | health-sheet-fullscreen 上拉 sheet 全屏（用户 attach 看进展确认）
 - 2026-05-20 13:14 | ⏳ | 💀 自动 kill | ui-polish-batch 完工 32 commit
 - 2026-05-20 11:50 | ✅ | 🚨 事故处理 | SSH key 覆盖事故全链路修复

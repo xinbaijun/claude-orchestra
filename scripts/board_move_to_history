@@ -1,0 +1,13 @@
+#!/bin/bash
+# board_move_to_history — 管家把完工 session 从活跃段搬到历史段顶部 + commit（5-28 落地）
+#
+# 替代「派 chore-runner 写 .prompts/move-X.md → tpush → chore-runner Edit + commit」的链路。
+# race 防护：worker /done 可能已自搬（自写详细版），历史段已有同 session 时跳过（不重复落地）。
+#
+# 用法：board_move_to_history <session-name> "<summary line>"
+#
+# 实现在 scripts/butler-helpers.sh，本文件仅做 source + dispatch。
+
+set -e
+source ${PROJECT_ROOT}/scripts/butler-helpers.sh
+board_move_to_history "$@"

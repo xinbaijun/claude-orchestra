@@ -1,0 +1,256 @@
+#!/bin/bash
+# xhmapi-token-load - 从 dio Prettier log 抽 token / 管理 V3 API tokens
+#
+# 用法：
+#   xhmapi-token-load <account>                        # 从默认 log 抽
+#   xhmapi-token-load <account> --from <log>           # 指定 log 源
+#   xhmapi-token-load <account> --paste                # 从 stdin 粘贴（手填）
+#   xhmapi-token-load --list                           # 列已有 token + payload 摘要
+#   xhmapi-token-load --verify <account>               # 校验 token 字段 + exp 过期
+#   xhmapi-token-load -h                                # usage
+#
+# 抽取逻辑（基于 Flutter dio Prettier 日志格式；其它后端日志格式可改 extract_token）：
+#   1. grep "║ Bearer eyJhbGc" 找最后匹配（最新登录）
+#   2. 连续读 `║ ` 行（dio 把 token 切成多块）
+#   3. 去掉 `║ ` 前缀 + Bearer + 行间空格 → concat
+#   4. 验证 JWT 3 段 base64url + alg + payload 字段（默认 HS512 + app_login_user_key）
+#   5. 写到 scripts/.tokens/<account>.txt（chmod 600）
+#
+# 默认 log 源按账号选（可被 --from 覆盖）— 模板默认逻辑（按业务定制）：
+#   guest_test_* → logs/new_user_log.txt
+#   其它 → logs/token_log.txt
+#
+# Token 是敏感数据，scripts/.tokens/ 应加进 .gitignore，永不入 repo。
+
+set -uo pipefail
+
+TOKEN_DIR="${PROJECT_ROOT}/scripts/.tokens"
+DEFAULT_LOG="${PROJECT_ROOT}/logs/token_log.txt"
+GUEST_LOG="${PROJECT_ROOT}/logs/new_user_log.txt"
+
+# 按账号挑默认 log（guest_test_* 走游客日志）— 业务相关，按需改
+pick_default_log() {
+  local acct="$1"
+  case "$acct" in
+    guest_test_*) echo "$GUEST_LOG" ;;
+    *) echo "$DEFAULT_LOG" ;;
+  esac
+}
+
+usage() {
+  cat <<EOF
+用法：xhmapi-token-load <account> [--from <log>] [--paste]
+      xhmapi-token-load --list
+      xhmapi-token-load --verify <account>
+      xhmapi-token-load -h
+
+参数：
+  <account>             账号短名（如 139 / 178 / guest_test_xxx）
+  --from <log>          指定 log 源（默认 $DEFAULT_LOG）
+  --paste               从 stdin 读 token（粘贴模式）
+  --list                列已存 token 文件 + payload 摘要
+  --verify <account>    校验 token 字段是否对（alg + payload 含 app_login_user_key）
+  -h                    本帮助
+
+输出文件：scripts/.tokens/<account>.txt（一行 raw token，无 Bearer 前缀，chmod 600）
+EOF
+}
+
+# base64url decode helper
+decode_b64url() {
+  local s="$1"
+  local pad=$(( (4 - ${#s} % 4) % 4 ))
+  printf '%s' "$s"
+  for ((i=0; i<pad; i++)); do printf '='; done
+  printf '\n'
+}
+b64url_to_json() {
+  local seg="$1"
+  decode_b64url "$seg" | tr '_-' '/+' | base64 -d 2>/dev/null
+}
+
+# 验证 token 字段（默认 alg=HS512 + payload 含 app_login_user_key；按业务改）
+verify_token() {
+  local token="$1"
+  local header_seg payload_seg sig_seg
+  header_seg=$(echo "$token" | cut -d. -f1)
+  payload_seg=$(echo "$token" | cut -d. -f2)
+  sig_seg=$(echo "$token" | cut -d. -f3)
+  if [ -z "$header_seg" ] || [ -z "$payload_seg" ] || [ -z "$sig_seg" ]; then
+    echo "❌ 不是合法 JWT（应有 3 段 base64url 用 . 分隔）" >&2
+    return 1
+  fi
+
+  local header_json payload_json
+  header_json=$(b64url_to_json "$header_seg")
+  payload_json=$(b64url_to_json "$payload_seg")
+  if [ -z "$header_json" ] || [ -z "$payload_json" ]; then
+    echo "❌ base64url decode 失败" >&2
+    return 1
+  fi
+
+  local alg user_key exp_ts
+  alg=$(echo "$header_json" | jq -r '.alg // empty' 2>/dev/null)
+  user_key=$(echo "$payload_json" | jq -r '.app_login_user_key // empty' 2>/dev/null)
+  exp_ts=$(echo "$payload_json" | jq -r '.exp // empty' 2>/dev/null)
+
+  if [ "$alg" != "HS512" ]; then
+    echo "⚠️  alg=$alg（期望 HS512；如果业务不同请改 verify_token）" >&2
+  fi
+  if [ -z "$user_key" ]; then
+    echo "❌ payload 没含 app_login_user_key 字段（如果业务字段不同请改 verify_token）" >&2
+    return 1
+  fi
+
+  # exp 过期检查
+  local exp_note=""
+  if [ -n "$exp_ts" ] && [ "$exp_ts" != "null" ]; then
+    local now=$(date +%s)
+    if [ "$exp_ts" -lt "$now" ]; then
+      local ago=$(( (now - exp_ts) / 60 ))
+      echo "❌ token 已过期（exp $(date -d @${exp_ts} '+%Y-%m-%d %H:%M' 2>/dev/null || echo $exp_ts) / 过期 ${ago} 分钟）" >&2
+      return 1
+    fi
+    local left=$(( (exp_ts - now) / 60 ))
+    if [ "$left" -lt 60 ]; then
+      exp_note=" / exp ${left}min 后过期"
+    else
+      exp_note=" / exp $(date -d @${exp_ts} '+%m-%d %H:%M' 2>/dev/null || echo $exp_ts)"
+    fi
+  fi
+
+  echo "✅ alg=$alg / user_key=$user_key${exp_note}"
+  return 0
+}
+
+# 从 log 抽 token（默认逻辑基于 Flutter dio Prettier 输出，按业务改）
+extract_token() {
+  local log="$1"
+  if [ ! -f "$log" ]; then
+    echo "❌ log 文件不存在: $log" >&2
+    return 1
+  fi
+
+  local start_line
+  start_line=$(grep -nE '║ Bearer eyJhbGc' "$log" 2>/dev/null | tail -1 | cut -d: -f1)
+  if [ -z "$start_line" ]; then
+    echo "❌ log 里没找到 '║ Bearer eyJhbGc...' 行（确认是 dio Prettier 输出且含登录后请求）" >&2
+    return 1
+  fi
+
+  local chunks
+  chunks=$(awk -v start="$start_line" '
+    NR == start { in_block = 1 }
+    in_block {
+      if (match($0, /║ /)) {
+        line = substr($0, RSTART + RLENGTH)
+        sub(/^Bearer /, "", line)
+        gsub(/[[:space:]]/, "", line)
+        printf "%s", line
+      } else {
+        exit
+      }
+    }
+    NR > start + 15 { exit }
+  ' "$log")
+
+  if [ -z "$chunks" ]; then
+    echo "❌ 拼接 token 失败（log line $start_line 之后没找到 ║ 后续 chunks）" >&2
+    return 1
+  fi
+
+  echo "$chunks"
+}
+
+# subcommand 分发
+if [ $# -eq 0 ]; then
+  usage >&2
+  exit 1
+fi
+
+if [ "$1" = "--list" ]; then
+  if [ ! -d "$TOKEN_DIR" ] || [ -z "$(ls -A "$TOKEN_DIR" 2>/dev/null | grep -v README)" ]; then
+    echo "ℹ️  $TOKEN_DIR 目录空（先跑 xhmapi-token-load <account> 抽 token）"
+    exit 0
+  fi
+  for f in "$TOKEN_DIR"/*.txt; do
+    [ -e "$f" ] || continue
+    name=$(basename "$f" .txt)
+    token=$(head -1 "$f" | tr -d '[:space:]')
+    if [ -z "$token" ]; then
+      echo "  $name → (空)"
+      continue
+    fi
+    payload_seg=$(echo "$token" | cut -d. -f2)
+    payload_json=$(b64url_to_json "$payload_seg")
+    user_key=$(echo "$payload_json" | jq -r '.app_login_user_key // "?"' 2>/dev/null)
+    bytes=$(wc -c < "$f" | tr -d ' ')
+    echo "  $name → user_key=$user_key bytes=$bytes"
+  done
+  exit 0
+fi
+
+if [ "$1" = "--verify" ]; then
+  if [ -z "${2:-}" ]; then
+    echo "❌ --verify 需要 account 参数" >&2
+    exit 1
+  fi
+  TOKEN_FILE="$TOKEN_DIR/${2}.txt"
+  if [ ! -f "$TOKEN_FILE" ]; then
+    echo "❌ $TOKEN_FILE 不存在" >&2
+    exit 1
+  fi
+  TOKEN=$(head -1 "$TOKEN_FILE" | tr -d '[:space:]')
+  verify_token "$TOKEN"
+  exit $?
+fi
+
+if [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
+  usage
+  exit 0
+fi
+
+ACCOUNT="$1"
+shift
+LOG_PATH=$(pick_default_log "$ACCOUNT")
+PASTE_MODE=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --from) LOG_PATH="$2"; shift 2 ;;
+    --paste) PASTE_MODE=1; shift ;;
+    *) echo "❌ 未知选项: $1" >&2; usage >&2; exit 1 ;;
+  esac
+done
+
+mkdir -p "$TOKEN_DIR"
+chmod 700 "$TOKEN_DIR"
+OUT_FILE="$TOKEN_DIR/${ACCOUNT}.txt"
+
+if [ "$PASTE_MODE" = "1" ]; then
+  echo "ℹ️  粘贴 token 后 Ctrl+D 提交（一行 raw token，无 Bearer 前缀）：" >&2
+  TOKEN=$(cat | tr -d '[:space:]')
+  if [ -z "$TOKEN" ]; then
+    echo "❌ stdin 空" >&2
+    exit 1
+  fi
+  echo "$TOKEN" > "$OUT_FILE"
+  chmod 600 "$OUT_FILE"
+  echo "✅ token 已存 $OUT_FILE"
+  verify_token "$TOKEN"
+  exit $?
+fi
+
+echo "🔍 从 $LOG_PATH 抽 $ACCOUNT 的 token..."
+TOKEN=$(extract_token "$LOG_PATH")
+if [ -z "$TOKEN" ]; then
+  exit 1
+fi
+
+if ! verify_token "$TOKEN" >&2; then
+  echo "❌ token 校验不过；--paste 模式手填 / 或检查 log 格式" >&2
+  exit 1
+fi
+
+echo "$TOKEN" > "$OUT_FILE"
+chmod 600 "$OUT_FILE"
+echo "✅ token ($(wc -c < "$OUT_FILE" | tr -d ' ') bytes) 已存 $OUT_FILE"

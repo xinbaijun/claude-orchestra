@@ -1,0 +1,14 @@
+#!/bin/bash
+# board_register — 管家给 session_board 活跃段顶部追加新一行 + commit（5-28 落地）
+#
+# 替代「派 chore-runner 写 .prompts/register-X.md → tpush → chore-runner Edit + commit」的链路。
+# race 防护：活跃段已有同 session 时跳过（worker 自注册过了）。
+#
+# 用法：board_register <session-name> "<task>" [jsonl-prefix]
+# 例：  board_register iap-product-sync "iOS 支付 debug — 接 hot context 续作" c2abf518
+#
+# 实现在 scripts/butler-helpers.sh，本文件仅做 source + dispatch。
+
+set -e
+source ${PROJECT_ROOT}/scripts/butler-helpers.sh
+board_register "$@"

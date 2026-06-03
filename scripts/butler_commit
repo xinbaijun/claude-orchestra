@@ -1,0 +1,13 @@
+#!/bin/bash
+# butler_commit — 管家 batch commit butler_decisions.md dirty 改动（5-28 落地）
+#
+# 替代「派 chore-runner 写 .prompts/butler-batch-HHMM.md → tpush → chore-runner cc commit」的 4 跳链路。
+# clean 时跳过（自动 dirty 检测）。
+#
+# 用法：butler_commit
+#
+# 实现在 scripts/butler-helpers.sh，本文件仅做 source + dispatch。
+
+set -e
+source ${PROJECT_ROOT}/scripts/butler-helpers.sh
+butler_commit "$@"

@@ -8,6 +8,7 @@
 #
 # 用法：
 #   bash scripts/install.sh
+#   INSTALL_XHMAPI=1 bash scripts/install.sh   # 也装 V3 API curl wrapper（opt-in）
 # 之后任何 shell（包括 Claude 非交互 Bash）都能直接调工具名。
 # 幂等：重复跑只会覆盖 launcher，不会重复污染。
 
@@ -28,12 +29,73 @@ EOF
   echo "✅ 安装 $launcher → exec bash $target"
 }
 
+# inline_launcher — 救活类工具脱 sshfs 依赖（C.2，5-31 落地）
+#
+# 跟 install_launcher 的区别：不写 `exec bash $target`，而是把 $target 全文 inline
+# 进 launcher，对 `source ${PROJECT_ROOT}/scripts/<lib>.sh` 行 sed 替换为库内容。
+# 用途：sshfs 挂载死时仍能跑（救活 sshfs-check 等）。
+#
+# 限制：被 inline 的脚本不能嵌套 source（仅展开 1 层）；改 repo 里 $target 或公共库
+# 后必须重跑 `bash scripts/install.sh` 才生效（普通 launcher 改完立即生效）。
+#
+# 设计哲学："源代码仍在 repo，install.sh 当 build step 生成部署副本"。
+inline_launcher() {
+  local name="$1"
+  local target="$2"
+  local launcher="/usr/local/bin/$name"
+
+  {
+    echo "#!/bin/bash"
+    echo "# Auto-generated bundle by ${PROJECT_ROOT}/scripts/install.sh (inline_launcher) — DO NOT EDIT."
+    echo "# 源文件：$target（+ 1 层 source 公共库 inline）"
+    echo "# 自包含：sshfs 挂载死时仍可跑（救活类工具脱 ${PROJECT_ROOT} 依赖）"
+    echo "# 改源代码后必须重跑 \`bash scripts/install.sh\` 才生效"
+    echo ""
+    awk -v root="${PROJECT_ROOT}" '
+      NR==1 && /^#!/ { next }
+      $0 ~ "^source " root "/scripts/.+\\.sh$" {
+        lib_path = $2
+        print "# ---- BEGIN inline " lib_path " ----"
+        while ((getline line < lib_path) > 0) {
+          if (line !~ /^#!/) print line
+        }
+        close(lib_path)
+        print "# ---- END inline " lib_path " ----"
+        next
+      }
+      { print }
+    ' "$target"
+  } > "$launcher"
+  chmod +x "$launcher"
+  echo "✅ inline $launcher ← bundle($target + libs)"
+}
+
+# ---- 通用 worker 工具（必装）----
 install_launcher tspawn        ${PROJECT_ROOT}/scripts/tspawn
 install_launcher tpush         ${PROJECT_ROOT}/scripts/tpush
 install_launcher revive        ${PROJECT_ROOT}/scripts/revive
 install_launcher jsonl-status  ${PROJECT_ROOT}/scripts/jsonl-status
 install_launcher myjsonl       ${PROJECT_ROOT}/scripts/myjsonl
 install_launcher work_log      ${PROJECT_ROOT}/scripts/work_log
+
+# ---- 管家 bash function 套件（5-28 落地：替代 chore-runner 5-跳链路的纯机械活）----
+install_launcher butler_commit            ${PROJECT_ROOT}/scripts/butler_commit
+install_launcher board_register           ${PROJECT_ROOT}/scripts/board_register
+install_launcher board_refresh_timestamp  ${PROJECT_ROOT}/scripts/board_refresh_timestamp
+install_launcher board_move_to_history    ${PROJECT_ROOT}/scripts/board_move_to_history
+
+# ---- sshfs fail-fast 健康检测（5-28 落地：cc Bash 进死挂载点防 D state）----
+# C.2 inline：sshfs 死时也要能跑 → inline_launcher 自包含
+inline_launcher sshfs-check               ${PROJECT_ROOT}/scripts/sshfs-check
+
+# ---- API curl wrapper（opt-in，仅 INSTALL_XHMAPI=1 时装）----
+# 用途：worker 一行 curl 测后端 REST API（含 token 自动管理）
+# 业务相关，不强装；不做 REST API 项目可永远不开
+if [ "${INSTALL_XHMAPI:-0}" = "1" ]; then
+  install_launcher xhmapi                 ${PROJECT_ROOT}/scripts/xhmapi
+  install_launcher xhmapi-token-load      ${PROJECT_ROOT}/scripts/xhmapi-token-load
+  echo "ℹ️  xhmapi opt-in 装好；配置默认 host / 账号见 scripts/xhmapi 顶部注释"
+fi
 
 # ----- tmux bell 透传配置（幂等追加到 ~/.tmux.conf） -----
 #
@@ -55,7 +117,6 @@ set -g bell-action any
 set -g visual-bell off
 EOF
   echo "✅ 追加 tmux bell 配置到 $tmux_conf"
-  # 如果在 tmux 里跑 install.sh，顺手 reload 让现存 session 立即生效
   if [ -n "$TMUX" ]; then
     tmux source "$tmux_conf" 2>/dev/null && echo "✅ tmux source 已 reload"
   fi
@@ -64,10 +125,6 @@ else
 fi
 
 # ----- tmux history-limit 调大（幂等追加，独立 marker） -----
-#
-# 为什么需要：cc 长跑刷量大 + capture-pane 调试常需回看，默认 2000 行翻几下到顶。
-# 50000 行内存代价 ~50MB/pane，服务器富裕可接受。
-#
 tmux_history_marker="# history-limit 调大（cc 长跑 + capture-pane 调试回看）"
 if [ ! -f "$tmux_conf" ] || ! grep -qF "$tmux_history_marker" "$tmux_conf"; then
   cat >> "$tmux_conf" <<EOF
@@ -86,16 +143,6 @@ else
 fi
 
 # ----- 关右键 display-menu 防误触 Kill pane / Kill window -----
-#
-# 为什么需要：tmux 3.6a 默认在 root table 绑了 6 个 MouseDown3*（右键），点出
-# 的 menu 含 "Kill pane" / "Kill window" 项。容易误触把 cc worker 进程杀掉，
-# 需要 cc --resume 救活。unbind 6 个右键 binding 关菜单。
-#
-# 副作用：失去右键 Split / Swap / Mark 等便利项。
-# 不影响：左键 select-pane / 中键 paste / 拖选 copy-mode / 拖 border resize /
-#         滚轮 / 双击 select-word / 三击 select-line / 点 status 切 window。
-# Kill 仍能通过 prefix + x / & 触发（有意识 keystroke 不易误触）。
-#
 tmux_rightclick_marker="# 关右键 display-menu 防误触 Kill pane / Kill window"
 if [ ! -f "$tmux_conf" ] || ! grep -qF "$tmux_rightclick_marker" "$tmux_conf"; then
   cat >> "$tmux_conf" <<TMUX_RCEOF
@@ -120,6 +167,12 @@ fi
 echo ""
 echo "✅ 全部就绪。验证："
 echo "   which tspawn tpush revive jsonl-status myjsonl work_log"
+echo "   which butler_commit board_register board_refresh_timestamp board_move_to_history"
+echo "   which sshfs-check"
 echo "   jsonl-status                # 全部 session（除管家 ${BUTLER_SESSION}）"
 echo "   myjsonl                     # 自查 cc jsonl UUID"
+echo "   sshfs-check                 # 检 ${PROJECT_ROOT} 挂载健康"
 echo "   tmux show-options -g | grep -E 'bell-action|visual-bell|history-limit'"
+if [ "${INSTALL_XHMAPI:-0}" = "1" ]; then
+  echo "   which xhmapi xhmapi-token-load"
+fi

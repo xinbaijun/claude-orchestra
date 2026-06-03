@@ -1,0 +1,172 @@
+#!/bin/bash
+# xhmapi - REST API curl wrapper for all workers（V3 API 测试苦力替代）
+#
+# 用法：
+#   xhmapi GET /some/path
+#   xhmapi GET '/some/path?foo=bar'
+#   xhmapi POST /some/path '{"field":"value"}'
+#   xhmapi -u <account> GET /path             # 切账号（默认 ${TEST_ACCOUNT}）
+#   xhmapi -t <token> GET /path               # 临时 token 入参（不读 token 文件）
+#   xhmapi --raw GET /path                    # 不 jq 美化输出原始 body
+#   xhmapi --no-exit-fail GET /path           # code!=0 不 exit 1（管道兼容）
+#   xhmapi -v GET /path                       # verbose（含 request/response header）
+#   xhmapi -h                                  # usage
+#
+# 默认：
+#   host = ${API_HOST}
+#   account = ${TEST_ACCOUNT}（token 文件 scripts/.tokens/${TEST_ACCOUNT}.txt）
+#   自动加 Authorization: Bearer <token>
+#   自动加 Content-Type: application/json（仅 POST/PUT/PATCH 有 body 时）
+#   默认 jq 美化输出（tty 自动彩色 / 管道纯文本），--raw 关
+#   默认 code!=0 → exit 1，--no-exit-fail 关
+#
+# 配套：xhmapi-token-load 抽 token / 切账号
+
+set -uo pipefail
+
+HOST="${XHMAPI_HOST:-${API_HOST}}"
+TOKEN_DIR="${PROJECT_ROOT}/scripts/.tokens"
+DEFAULT_ACCOUNT="${TEST_ACCOUNT}"
+
+usage() {
+  cat <<EOF
+用法：xhmapi [-u <account>] [-t <token>] [--raw] [--no-exit-fail] [-v] [-h] <method> <path> [body_json]
+
+参数：
+  <method>    GET / POST / PUT / PATCH / DELETE
+  <path>      API 路径（如 /v3/foo 或 /v3/bar/123?x=y）
+  [body_json] POST/PUT/PATCH 时 body JSON 字符串（可省，会自动加 Content-Type）
+
+选项：
+  -u <acct>          切账号（默认 ${DEFAULT_ACCOUNT}）；token 文件 scripts/.tokens/<acct>.txt
+  -t, --token <tok>  临时 token 入参（不读 token 文件，优先级 -t > -u > 默认账号）
+  --raw              输出原始 body（不 jq 美化）
+  --no-exit-fail     code!=0 时仍 exit 0（管道 / 链式工具兼容）
+  -v                 verbose 模式（含 request/response header / curl -v）
+  -h                 显示本帮助
+
+环境变量：
+  XHMAPI_HOST   覆盖默认 host（默认 ${API_HOST}）
+
+依赖：curl + jq + scripts/.tokens/<account>.txt（用 xhmapi-token-load 抽取）
+EOF
+}
+
+# 解析 flags
+ACCOUNT="$DEFAULT_ACCOUNT"
+TOKEN_OVERRIDE=""
+RAW=0
+VERBOSE=0
+NO_EXIT_FAIL=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    -u) ACCOUNT="$2"; shift 2 ;;
+    -t|--token) TOKEN_OVERRIDE="$2"; shift 2 ;;
+    --raw) RAW=1; shift ;;
+    --no-exit-fail) NO_EXIT_FAIL=1; shift ;;
+    -v) VERBOSE=1; shift ;;
+    --) shift; break ;;
+    -*) echo "❌ 未知选项: $1" >&2; usage >&2; exit 1 ;;
+    *) break ;;
+  esac
+done
+
+if [ $# -lt 2 ]; then
+  usage >&2
+  exit 1
+fi
+
+METHOD="$1"
+PATH_ARG="$2"
+BODY="${3:-}"
+
+# 校验 method
+case "$METHOD" in
+  GET|POST|PUT|PATCH|DELETE) ;;
+  *)
+    echo "❌ 不支持的 method: $METHOD（仅 GET/POST/PUT/PATCH/DELETE）" >&2
+    exit 1
+    ;;
+esac
+
+# 拿 token：-t 临时入参优先 > -u 账号文件 > 默认账号
+if [ -n "$TOKEN_OVERRIDE" ]; then
+  TOKEN=$(printf '%s' "$TOKEN_OVERRIDE" | tr -d '[:space:]')
+  if [ -z "$TOKEN" ]; then
+    echo "❌ -t/--token 入参为空" >&2
+    exit 2
+  fi
+else
+  TOKEN_FILE="$TOKEN_DIR/${ACCOUNT}.txt"
+  if [ ! -f "$TOKEN_FILE" ]; then
+    cat >&2 <<EOF
+❌ token 文件不存在: $TOKEN_FILE
+   抽取：xhmapi-token-load $ACCOUNT
+   或粘贴：xhmapi-token-load $ACCOUNT --paste
+   或临时：xhmapi -t <token> ...
+EOF
+    exit 2
+  fi
+  TOKEN=$(head -1 "$TOKEN_FILE" | tr -d '[:space:]')
+  if [ -z "$TOKEN" ]; then
+    echo "❌ token 文件 $TOKEN_FILE 为空" >&2
+    exit 2
+  fi
+fi
+
+# 拼 url（path 已含 query 参数）
+URL="${HOST}${PATH_ARG}"
+
+# curl 参数
+CURL_OPTS=(
+  -sS
+  -H "Authorization: Bearer $TOKEN"
+  -X "$METHOD"
+)
+if [ "$VERBOSE" = "1" ]; then
+  CURL_OPTS=(-v "${CURL_OPTS[@]}")
+fi
+
+# body 处理：仅 POST/PUT/PATCH 加
+if [ -n "$BODY" ]; then
+  case "$METHOD" in
+    POST|PUT|PATCH)
+      CURL_OPTS+=(-H "Content-Type: application/json" -d "$BODY")
+      ;;
+    *)
+      echo "⚠️  $METHOD 通常不带 body（忽略 body 参数）" >&2
+      ;;
+  esac
+fi
+
+# 跑 curl + 处理输出
+if [ "$RAW" = "1" ]; then
+  exec curl "${CURL_OPTS[@]}" "$URL"
+fi
+
+# 默认 jq 美化（jq 失败时 fallback 原始输出）
+RESP=$(curl "${CURL_OPTS[@]}" "$URL" 2>&1)
+CURL_RC=$?
+if [ $CURL_RC -ne 0 ]; then
+  echo "$RESP" >&2
+  exit $CURL_RC
+fi
+
+# jq 彩色按 tty 检测：stdout 是终端走 -C，管道走纯文本（避免 ANSI 污染 grep/jq 下游）
+JQ_OPTS=()
+[ -t 1 ] && JQ_OPTS=(-C)
+
+if echo "$RESP" | jq "${JQ_OPTS[@]}" . 2>/dev/null; then
+  # jq parse OK，已输出
+  # 业务码非 0 → exit 1（方便链式判断），但仍输出 body；--no-exit-fail 关掉
+  CODE=$(echo "$RESP" | jq -r '.code // empty' 2>/dev/null)
+  if [ -n "$CODE" ] && [ "$CODE" != "0" ] && [ "$NO_EXIT_FAIL" != "1" ]; then
+    exit 1
+  fi
+  exit 0
+else
+  # 非 JSON 响应（如 HTML 错误页 / 流式 chunked）→ raw fallback
+  echo "$RESP"
+  exit 0
+fi

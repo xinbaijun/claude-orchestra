@@ -1,7 +1,7 @@
 #!/bin/bash
 # tpush — 给现存 cc worker push prompt（load-buffer + paste-buffer + Enter 三件套）
 #
-# Step 0 防呆：检查目标是否在权限框（cc 1/2/3 选项选择器），命中
+# Step 0 防呆（5-18 加）：检查目标是否在权限框（cc 1/2/3 选项选择器），命中
 # fail-fast 不真 push —— cc 权限选择器会吃 paste / 把多行 markdown 误解析为
 # 按键，任务直接丢。
 #
@@ -13,7 +13,7 @@
 #   0  成功
 #   1  prompt 文件不存在
 #   2  session 不存在
-#   3  目标在权限框等待批准
+#   3  目标在权限框等待批准（5-18 加）
 
 set -euo pipefail
 
@@ -26,8 +26,8 @@ if [[ ! -f "$PROMPT" ]]; then
   exit 1
 fi
 
-if ! tmux has-session -t "$SESSION" 2>/dev/null; then
-  echo "❌ session 不存在: $SESSION（tmux ls 看下名字是否拼错）" >&2
+if ! tmux has-session -t "$SESSION" 2>/dev/null && ! tmux list-windows -t "${SESSION%%:*}" 2>/dev/null | grep -q .; then
+  echo "❌ target 不存在: $SESSION（tmux ls / tmux list-windows 看下）" >&2
   exit 2
 fi
 
@@ -37,7 +37,7 @@ if [[ "$FORCE" != "--force" ]]; then
   if echo "$tail" | grep -qE 'Do you want to proceed\?|Yes, and don.t ask again|Yes, allow all edits during this session|❯[[:space:]]+1\.[[:space:]]Yes|❯[[:space:]]+2\.[[:space:]]No'; then
     cat >&2 <<EOF
 ⚠️  $SESSION 正在权限框等待批准，push 不安全
-    原因：cc 权限选择器会吃 paste / 把多行 markdown 误解析为按键，任务直接丢
+    原因：${CLI_CMD} 权限选择器会吃 paste / 把多行 markdown 误解析为按键，任务直接丢
     选项：
       1. tmux attach -t $SESSION  → 批准权限 → 再 tpush
       2. tpush $SESSION $PROMPT --force（跳过检查，仅紧急 case）
@@ -48,7 +48,7 @@ fi
 
 tmux load-buffer "$PROMPT"
 tmux paste-buffer -t "$SESSION"
-sleep 0.5  # cc 消化 paste 后再 Enter 防时序 race（thinking 时 Enter 被吃掉 paste 留 buffer）
+sleep 0.5  # ${CLI_CMD} 消化 paste 后再 Enter 防时序 race（thinking 时 Enter 被吃掉 paste 留 buffer）
 tmux send-keys -t "$SESSION" Enter
 
 echo "✅ pushed $(wc -l < "$PROMPT") 行 → $SESSION"

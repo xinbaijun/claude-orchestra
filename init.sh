@@ -1,7 +1,7 @@
 #!/bin/bash
 # init.sh — claude-workflow-template 一次性配置
 #
-# 交互式问 5 项 → sed 替换模板 placeholder → 装 launcher → 生成最小 settings.local.json
+# 交互式问 5-7 项 → sed 替换模板 placeholder → 装 launcher → 生成最小 settings.local.json
 #
 # 用法：
 #   bash init.sh
@@ -34,6 +34,20 @@ GIT_WRAPPER=$(ask GIT_WRAPPER "git 命令名（可填 wrapper）" "git")
 JSONL_DIR_GUESS="$HOME/.claude/projects/-$(echo "$PROJECT_ROOT" | sed 's|^/||; s|/|-|g')"
 JSONL_DIR=$(ask JSONL_DIR "cc jsonl 目录（默认探测值）" "$JSONL_DIR_GUESS")
 
+# xhmapi opt-in（仅做 REST API 项目时才用）
+echo ""
+read -p "$(echo -e "${B}是否启用 xhmapi REST API curl wrapper？${R} [${YELLOW}n${R}]: ")" enable_xhmapi
+enable_xhmapi="${enable_xhmapi:-n}"
+if [[ "$enable_xhmapi" =~ ^[Yy]$ ]]; then
+  INSTALL_XHMAPI=1
+  API_HOST=$(ask API_HOST "API host（如 https://api.example.com）" "https://api.example.com")
+  TEST_ACCOUNT=$(ask TEST_ACCOUNT "默认测试账号短名（token 文件 scripts/.tokens/<acct>.txt）" "test_user")
+else
+  INSTALL_XHMAPI=0
+  API_HOST="https://api.example.com"
+  TEST_ACCOUNT="test_user"
+fi
+
 echo ""
 echo -e "${B}${GREEN}配置确认：${R}"
 cat <<EOF
@@ -43,6 +57,9 @@ cat <<EOF
   CLI_CMD          = $CLI_CMD
   GIT_WRAPPER      = $GIT_WRAPPER
   JSONL_DIR        = $JSONL_DIR
+  INSTALL_XHMAPI   = $INSTALL_XHMAPI
+  API_HOST         = $API_HOST
+  TEST_ACCOUNT     = $TEST_ACCOUNT
 EOF
 read -p "继续？[Y/n]: " confirm
 [[ "${confirm:-Y}" =~ ^[Yy]$ ]] || { echo "已取消"; exit 0; }
@@ -62,6 +79,13 @@ FILES=$(find . -type f \( \
     -name "jsonl-status" -o \
     -name "myjsonl" -o \
     -name "work_log" -o \
+    -name "butler_commit" -o \
+    -name "board_register" -o \
+    -name "board_refresh_timestamp" -o \
+    -name "board_move_to_history" -o \
+    -name "sshfs-check" -o \
+    -name "xhmapi" -o \
+    -name "xhmapi-token-load" -o \
     -name "settings.json" \
   \) \
   -not -path "./.git/*" \
@@ -79,6 +103,8 @@ for f in $FILES; do
     -e "s|\${CLI_CMD}|$CLI_CMD|g" \
     -e "s|\${GIT_WRAPPER}|$GIT_WRAPPER|g" \
     -e "s|\${JSONL_DIR}|$JSONL_DIR|g" \
+    -e "s|\${API_HOST}|$API_HOST|g" \
+    -e "s|\${TEST_ACCOUNT}|$TEST_ACCOUNT|g" \
     "$f"
 done
 echo "  ✅ 替换完成（处理 $(echo "$FILES" | wc -w) 个文件）"
@@ -87,15 +113,16 @@ echo "  ✅ 替换完成（处理 $(echo "$FILES" | wc -w) 个文件）"
 echo ""
 echo -e "${B}${BLUE}[2/3] 装 launcher 到 /usr/local/bin/...${R}"
 if [[ -w /usr/local/bin ]]; then
-  bash "$PROJECT_ROOT/scripts/install.sh"
+  INSTALL_XHMAPI=$INSTALL_XHMAPI bash "$PROJECT_ROOT/scripts/install.sh"
 else
   echo -e "  ${YELLOW}⚠️  /usr/local/bin 不可写${R}"
-  echo "     要么 sudo bash scripts/install.sh；要么自己 PATH 加 $PROJECT_ROOT/scripts/"
+  echo "     要么 sudo INSTALL_XHMAPI=$INSTALL_XHMAPI bash scripts/install.sh；要么自己 PATH 加 $PROJECT_ROOT/scripts/"
 fi
 
 # 4. 生成最小 settings.local.json
 echo ""
 echo -e "${B}${BLUE}[3/3] 生成 .claude/settings.local.json...${R}"
+mkdir -p .claude
 if [[ -f .claude/settings.local.json ]]; then
   echo -e "  ${YELLOW}✓ 已存在，跳过${R}（要重置删了再跑）"
 else
@@ -125,6 +152,12 @@ else
       "Bash(jsonl-status)",
       "Bash(jsonl-status:*)",
       "Bash(work_log:*)",
+      "Bash(butler_commit)",
+      "Bash(board_register:*)",
+      "Bash(board_refresh_timestamp:*)",
+      "Bash(board_move_to_history:*)",
+      "Bash(sshfs-check)",
+      "Bash(sshfs-check:*)",
       "Bash(date:*)",
       "Bash(wc -l:*)",
       "Edit(docs/ai-workflow/session_board.md)",
@@ -158,10 +191,26 @@ cat <<EOF
 
   4. 验证工具链：
        which tspawn tpush revive jsonl-status myjsonl
+       which butler_commit board_register board_refresh_timestamp board_move_to_history
+       which sshfs-check
        jsonl-status          # 全部 session（除管家）
        myjsonl               # 当前 cc jsonl UUID
+       sshfs-check           # 检 $PROJECT_ROOT 挂载健康（若在 sshfs 环境）
+EOF
+if [[ "$INSTALL_XHMAPI" = "1" ]]; then
+cat <<EOF
+       which xhmapi xhmapi-token-load
+       xhmapi-token-load --list   # 当前已存 token
 
-  5. 想了解每个 slash 命令的详细 SOP：
+  5. xhmapi 用法（REST API curl wrapper）：
+       xhmapi-token-load $TEST_ACCOUNT --paste  # 粘贴 token 入库
+       xhmapi GET /some/path                    # 调接口
+       详见 scripts/xhmapi 头注释
+EOF
+fi
+cat <<EOF
+
+  $([ "$INSTALL_XHMAPI" = "1" ] && echo "6." || echo "5.") 想了解每个 slash 命令的详细 SOP：
        cat .claude/commands/butler.md
        cat .claude/commands/dispatch.md
        ...
